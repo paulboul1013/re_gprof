@@ -8,8 +8,7 @@ using c to write simple like gprof show every function times(ms) and the number 
 1. show every functoin total, self times
 2. every function execute self time percent show
 3. the number of call by other function
+4. caller call callee times and what function are called
 
 # to-do
-1. Add show caller times
-2. caller->calle edge show
-3. sample target file
+1. sample target file
