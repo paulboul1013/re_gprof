@@ -27,6 +27,7 @@ typedef struct {
 
 
 static function_info_t functions[MAX_FUNCTIONS];
+static time_stamp caller_counts[MAX_FUNCTIONS][MAX_FUNCTIONS];
 static struct itimerval  timer;
 static int function_count=0;
 static int profiling_enabled=0;
@@ -118,6 +119,13 @@ void enter_function(int func_id) {
     functions[func_id].is_active=1;
     gettimeofday(&functions[func_id].start_time,NULL);
 
+    if (call_stack.top >= 0) {
+        int caller_id = call_stack.stack[call_stack.top];
+        if (caller_id >= 0 && caller_id < function_count) {
+            caller_counts[caller_id][func_id]++;
+        }
+    }
+
     if (call_stack.top < MAX_CALL_STACK-1){
         call_stack.stack[++call_stack.top]=func_id;
     }
@@ -174,6 +182,24 @@ void print_profiling_results() {
         }
     }
     printf("------------------------------------------------------------------------------------------------------------------\n");
+
+    // Show caller counts for each function
+    printf("\n--- Callers (counts) ---\n");
+    for (int callee = 0; callee < function_count; callee++) {
+        if (functions[callee].call_count == 0) continue;
+        int has_caller = 0;
+        printf("%-30s <- ", functions[callee].name);
+        for (int caller = 0; caller < function_count; caller++) {
+            if (caller_counts[caller][callee] > 0) {
+                has_caller = 1;
+                printf("%s(%llu) ", functions[caller].name, caller_counts[caller][callee]);
+            }
+        }
+        if (!has_caller) {
+            printf("[none]");
+        }
+        printf("\n");
+    }
 }
 
 static inline void __profile_cleanup_int(void *p) {
