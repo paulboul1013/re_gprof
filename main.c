@@ -5,8 +5,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <signal.h>
 #include <execinfo.h>
+#include <fcntl.h>
 
 
 #define MAX_FUNCTIONS 1000
@@ -20,9 +22,12 @@ typedef struct {
     char name[256];
     time_stamp total_time;
     time_stamp self_time;
+    time_stamp user_time;       // User mode CPU time (microseconds)
+    time_stamp sys_time;        // Kernel mode CPU time (microseconds)
     time_stamp call_count;
     int is_active;
     struct timeval start_time;
+    struct rusage start_rusage; // Resource usage at function entry
 } function_info_t;
 
 
@@ -105,6 +110,8 @@ int register_function(const char *name) {
     strncpy(functions[function_count].name,name,255);
     functions[function_count].total_time=0;
     functions[function_count].self_time = 0;
+    functions[function_count].user_time = 0;
+    functions[function_count].sys_time = 0;
     functions[function_count].call_count = 0;
     functions[function_count].is_active = 0;
 
@@ -118,6 +125,10 @@ void enter_function(int func_id) {
     functions[func_id].call_count++;
     functions[func_id].is_active=1;
     gettimeofday(&functions[func_id].start_time,NULL);
+
+    // Record resource usage at function entry (for user/system time tracking)
+    // Note: Using RUSAGE_SELF for now (single-threaded). Will switch to RUSAGE_THREAD in Phase 3.
+    getrusage(RUSAGE_SELF, &functions[func_id].start_rusage);
 
     if (call_stack.top >= 0) {
         int caller_id = call_stack.stack[call_stack.top];
@@ -135,12 +146,26 @@ void leave_function(int func_id) {
     if (func_id < 0 || func_id>=function_count) return;
 
     struct timeval end_time;
-    gettimeofday(&end_time,NULL);
+    struct rusage end_rusage;
 
+    gettimeofday(&end_time,NULL);
+    getrusage(RUSAGE_SELF, &end_rusage);
+
+    // Calculate total wall time
     long execute_time=(end_time.tv_sec-functions[func_id].start_time.tv_sec)*1000000 +
     (end_time.tv_usec - functions[func_id].start_time.tv_usec);
 
+    // Calculate user time (user mode CPU time)
+    long user_delta = (end_rusage.ru_utime.tv_sec - functions[func_id].start_rusage.ru_utime.tv_sec) * 1000000 +
+                      (end_rusage.ru_utime.tv_usec - functions[func_id].start_rusage.ru_utime.tv_usec);
+
+    // Calculate system time (kernel mode CPU time)
+    long sys_delta = (end_rusage.ru_stime.tv_sec - functions[func_id].start_rusage.ru_stime.tv_sec) * 1000000 +
+                     (end_rusage.ru_stime.tv_usec - functions[func_id].start_rusage.ru_stime.tv_usec);
+
     functions[func_id].total_time+=execute_time;
+    functions[func_id].user_time += user_delta;
+    functions[func_id].sys_time += sys_delta;
     // functions[func_id].self_time+=execute_time;
     functions[func_id].is_active=0;
 
@@ -151,10 +176,10 @@ void leave_function(int func_id) {
 
 
 void print_profiling_results() {
-    printf("\n=== profiling results ===\n");
-    printf("%-30s %12s %12s %12s %12s %15s %15s\n", 
-        "Function", "Calls", "Total(ms)", "Self(ms)", "Self%", "Self(ms)/call", "Total(ms)/call");
-    printf("------------------------------------------------------------------------------------------------------------------\n");
+    printf("\n=== Profiling Results (Enhanced) ===\n");
+    printf("%-30s %10s %10s %10s %10s %10s %10s %10s\n",
+        "Function", "Calls", "Total(ms)", "Self(ms)", "User(s)", "Sys(s)", "Self%", "Total/call");
+    printf("-------------------------------------------------------------------------------------------------------------------------------\n");
 
     time_stamp total_self_time=0;
 
@@ -166,22 +191,24 @@ void print_profiling_results() {
         if (functions[i].call_count > 0){
             double total_ms=functions[i].total_time/1000.0;
             double self_ms=functions[i].self_time/1000.0;
-            double self_percent=(total_self_time > 0) ? 
+            double user_s=functions[i].user_time/1000000.0;  // Convert microseconds to seconds
+            double sys_s=functions[i].sys_time/1000000.0;    // Convert microseconds to seconds
+            double self_percent=(total_self_time > 0) ?
             (functions[i].self_time * 100.0 / total_self_time) : 0;
-            double avg_self = (functions[i].call_count > 0) ? (self_ms / (double)functions[i].call_count) : 0.0;
             double avg_total = (functions[i].call_count > 0) ? (total_ms / (double)functions[i].call_count) : 0.0;
 
-            printf("%-30s %12llu %12.2f %12.2f %12.2f %15.3f %15.3f\n",
+            printf("%-30s %10llu %10.2f %10.2f %10.4f %10.4f %9.2f%% %10.3f\n",
                 functions[i].name,
                 functions[i].call_count,
                 total_ms,
                 self_ms,
+                user_s,
+                sys_s,
                 self_percent,
-                avg_self,
                 avg_total);
         }
     }
-    printf("------------------------------------------------------------------------------------------------------------------\n");
+    printf("-------------------------------------------------------------------------------------------------------------------------------\n");
 
     // Show caller counts for each function
     printf("\n--- Callers (counts) ---\n");
@@ -243,10 +270,38 @@ void function_b() {
 
 void function_c() {
     PROFILE_FUNCTION();
-   
+
 
     for(volatile int i=0;i<2000000;i++);
     function_b();
+}
+
+// I/O intensive function - should show high system time
+void function_io_heavy() {
+    PROFILE_FUNCTION();
+
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd < 0) return;
+
+    char buffer[1024] = {0};
+    // Perform many write system calls (causes kernel mode time)
+    for (int i = 0; i < 5000; i++) {
+        write(fd, buffer, sizeof(buffer));
+    }
+
+    close(fd);
+}
+
+// CPU intensive function - should show high user time
+void function_cpu_heavy() {
+    PROFILE_FUNCTION();
+
+    volatile double result = 0.0;
+    // Pure CPU computation (user mode only)
+    for (int i = 0; i < 2000000; i++) {
+        result += i * 3.14159;
+        result /= (i + 1.0);
+    }
 }
 
 int main(){
@@ -262,9 +317,11 @@ int main(){
 #endif
 
     printf("Start  profiling...\n");
+    printf("Testing User/System time separation...\n");
     start_profiling();
 
-    for (int i=0;i<5;i++){
+    // Original CPU-intensive tests
+    for (int i=0;i<3;i++){
         PROFILE_SCOPE("main_loop");
         function_a();
         function_b();
@@ -272,6 +329,13 @@ int main(){
 
         for (volatile int j=0;j<1000000;j++);
     }
+
+    // Phase 1 tests: User vs System time
+    printf("Running CPU-heavy test...\n");
+    function_cpu_heavy();
+
+    printf("Running I/O-heavy test...\n");
+    function_io_heavy();
 
     stop_profiling();
     
