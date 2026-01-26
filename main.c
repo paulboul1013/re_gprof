@@ -46,6 +46,23 @@ static function_registry_entry_t global_function_registry[MAX_GLOBAL_FUNCTIONS];
 static int global_function_count = 0;
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// ============================================================
+// Phase 4: Thread Data Collection
+// ============================================================
+
+// Thread profiling data snapshot (copy of TLS data)
+typedef struct {
+    pid_t thread_id;
+    int function_count;
+    function_info_t functions[MAX_FUNCTIONS];
+    time_stamp caller_counts[MAX_FUNCTIONS][MAX_FUNCTIONS];
+} thread_data_snapshot_t;
+
+#define MAX_THREADS 64
+static thread_data_snapshot_t* thread_snapshots[MAX_THREADS];
+static int thread_snapshot_count = 0;
+static pthread_mutex_t snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 // Thread-local storage (Phase 3): Each thread has its own profiling data
 __thread function_info_t functions[MAX_FUNCTIONS];
@@ -256,11 +273,48 @@ void leave_function(int func_id) {
 }
 
 
+// Phase 4: Register current thread's profiling data to global collection
+void register_thread_data() {
+    pid_t tid = current_thread_id ? current_thread_id : syscall(SYS_gettid);
+
+    // Skip if no profiling data
+    if (function_count == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&snapshot_mutex);
+
+    if (thread_snapshot_count >= MAX_THREADS) {
+        pthread_mutex_unlock(&snapshot_mutex);
+        fprintf(stderr, "Warning: Max threads exceeded, cannot register thread data\n");
+        return;
+    }
+
+    // Allocate snapshot
+    thread_data_snapshot_t* snapshot = malloc(sizeof(thread_data_snapshot_t));
+    if (!snapshot) {
+        pthread_mutex_unlock(&snapshot_mutex);
+        fprintf(stderr, "Error: Failed to allocate thread snapshot\n");
+        return;
+    }
+
+    // Copy TLS data to snapshot
+    snapshot->thread_id = tid;
+    snapshot->function_count = function_count;
+    memcpy(snapshot->functions, functions, sizeof(functions));
+    memcpy(snapshot->caller_counts, caller_counts, sizeof(caller_counts));
+
+    // Add to global collection
+    thread_snapshots[thread_snapshot_count++] = snapshot;
+
+    pthread_mutex_unlock(&snapshot_mutex);
+}
+
 void print_profiling_results() {
     // Get current thread ID for display
     pid_t tid = current_thread_id ? current_thread_id : syscall(SYS_gettid);
 
-    printf("\n=== Profiling Results (Phase 3: Thread %d) ===\n", tid);
+    printf("\n=== Profiling Results (Phase 4: Thread %d) ===\n", tid);
     printf("%-30s %10s %10s %10s %10s %10s %10s %10s %10s\n",
         "Function", "Calls", "Total(ms)", "Self(ms)", "User(s)", "Sys(s)", "Wait(s)", "Self%", "Total/call");
     printf("------------------------------------------------------------------------------------------------------------------------------------------\n");
@@ -321,8 +375,9 @@ static inline void __profile_cleanup_int(void *p) {
 }
 
 #ifdef AUTO_PROFILE
+// Phase 4 fix: Use __thread for function ID to support multi-threading
 #define PROFILE_FUNCTION()                                                     \
-    static int __func_id = -1;                                                 \
+    static __thread int __func_id = -1;                                        \
     if (__func_id == -1) {                                                     \
         __func_id = register_function(__func__);                               \
     }                                                                          \
@@ -330,7 +385,7 @@ static inline void __profile_cleanup_int(void *p) {
     __attribute__((cleanup(__profile_cleanup_int))) int __profile_scope_guard = __func_id;
 
 #define PROFILE_SCOPE(name)                                                    \
-    static int __scope_id_##__LINE__ = -1;                                     \
+    static __thread int __scope_id_##__LINE__ = -1;                            \
     if (__scope_id_##__LINE__ == -1) {                                         \
         __scope_id_##__LINE__ = register_function(name);                       \
     }                                                                          \
@@ -439,6 +494,158 @@ void function_mixed() {
 }
 
 // ============================================================
+// Phase 4: Report Generation Functions
+// ============================================================
+
+// Print report for a single thread snapshot
+void print_thread_report(thread_data_snapshot_t* snapshot) {
+    printf("\n=== Thread %d Report ===\n", snapshot->thread_id);
+    printf("%-30s %10s %10s %10s %10s %10s %10s %10s %10s\n",
+        "Function", "Calls", "Total(ms)", "Self(ms)", "User(s)", "Sys(s)", "Wait(s)", "Self%", "Total/call");
+    printf("------------------------------------------------------------------------------------------------------------------------------------------\n");
+
+    time_stamp total_self_time = 0;
+    for (int i = 0; i < snapshot->function_count; i++) {
+        total_self_time += snapshot->functions[i].self_time;
+    }
+
+    for (int i = 0; i < snapshot->function_count; i++) {
+        if (snapshot->functions[i].call_count > 0) {
+            double total_ms = snapshot->functions[i].total_time / 1000.0;
+            double self_ms = snapshot->functions[i].self_time / 1000.0;
+            double user_s = snapshot->functions[i].user_time / 1000000.0;
+            double sys_s = snapshot->functions[i].sys_time / 1000000.0;
+            double wait_s = snapshot->functions[i].wait_time / 1000000.0;
+            double self_percent = (total_self_time > 0) ?
+                (snapshot->functions[i].self_time * 100.0 / total_self_time) : 0;
+            double avg_total = (snapshot->functions[i].call_count > 0) ?
+                (total_ms / (double)snapshot->functions[i].call_count) : 0.0;
+
+            printf("%-30s %10llu %10.2f %10.2f %10.4f %10.4f %10.4f %9.2f%% %10.3f\n",
+                snapshot->functions[i].name,
+                snapshot->functions[i].call_count,
+                total_ms, self_ms, user_s, sys_s, wait_s,
+                self_percent, avg_total);
+        }
+    }
+    printf("------------------------------------------------------------------------------------------------------------------------------------------\n");
+}
+
+// Print per-thread reports
+void print_per_thread_reports() {
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Per-Thread Profiling Reports (Phase 4)\n");
+    printf("================================================================================\n");
+    printf("Total threads: %d\n", thread_snapshot_count);
+
+    for (int i = 0; i < thread_snapshot_count; i++) {
+        print_thread_report(thread_snapshots[i]);
+    }
+}
+
+// Print merged report (aggregate all threads)
+void print_merged_report() {
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Merged Profiling Report (All Threads - Phase 4)\n");
+    printf("================================================================================\n");
+    printf("Total threads: %d\n", thread_snapshot_count);
+
+    if (thread_snapshot_count == 0) {
+        printf("No thread data collected.\n");
+        return;
+    }
+
+    // Merged data structure (use global function registry for mapping)
+    typedef struct {
+        char name[256];
+        time_stamp total_time;
+        time_stamp self_time;
+        time_stamp user_time;
+        time_stamp sys_time;
+        time_stamp wait_time;
+        time_stamp call_count;
+        int thread_count;  // How many threads called this function
+    } merged_function_t;
+
+    merged_function_t merged[MAX_GLOBAL_FUNCTIONS];
+    memset(merged, 0, sizeof(merged));
+
+    // Initialize function names from global registry
+    for (int i = 0; i < global_function_count; i++) {
+        strncpy(merged[i].name, global_function_registry[i].name, 255);
+    }
+
+    // Aggregate data from all threads
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        thread_data_snapshot_t* snapshot = thread_snapshots[t];
+
+        for (int f = 0; f < snapshot->function_count; f++) {
+            if (snapshot->functions[f].call_count == 0) continue;
+
+            // Find function in global registry
+            int global_id = -1;
+            for (int g = 0; g < global_function_count; g++) {
+                if (strcmp(snapshot->functions[f].name, global_function_registry[g].name) == 0) {
+                    global_id = g;
+                    break;
+                }
+            }
+
+            if (global_id >= 0) {
+                merged[global_id].total_time += snapshot->functions[f].total_time;
+                merged[global_id].self_time += snapshot->functions[f].self_time;
+                merged[global_id].user_time += snapshot->functions[f].user_time;
+                merged[global_id].sys_time += snapshot->functions[f].sys_time;
+                merged[global_id].wait_time += snapshot->functions[f].wait_time;
+                merged[global_id].call_count += snapshot->functions[f].call_count;
+                merged[global_id].thread_count++;
+            }
+        }
+    }
+
+    // Print merged report
+    printf("\n%-30s %10s %10s %10s %10s %10s %10s %10s %10s\n",
+        "Function", "Calls", "Threads", "Total(ms)", "User(s)", "Sys(s)", "Wait(s)", "Avg/call", "Total/call");
+    printf("------------------------------------------------------------------------------------------------------------------------------------------\n");
+
+    time_stamp total_self_time = 0;
+    for (int i = 0; i < global_function_count; i++) {
+        total_self_time += merged[i].self_time;
+    }
+
+    for (int i = 0; i < global_function_count; i++) {
+        if (merged[i].call_count > 0) {
+            double total_ms = merged[i].total_time / 1000.0;
+            double user_s = merged[i].user_time / 1000000.0;
+            double sys_s = merged[i].sys_time / 1000000.0;
+            double wait_s = merged[i].wait_time / 1000000.0;
+            double avg_per_call = (merged[i].call_count > 0) ?
+                (total_ms / (double)merged[i].call_count) : 0.0;
+            double total_per_call = total_ms / (double)merged[i].call_count;
+
+            printf("%-30s %10llu %10d %10.2f %10.4f %10.4f %10.4f %10.3f %10.3f\n",
+                merged[i].name,
+                merged[i].call_count,
+                merged[i].thread_count,
+                total_ms, user_s, sys_s, wait_s,
+                avg_per_call, total_per_call);
+        }
+    }
+    printf("------------------------------------------------------------------------------------------------------------------------------------------\n");
+}
+
+// Cleanup thread snapshots
+void cleanup_thread_snapshots() {
+    for (int i = 0; i < thread_snapshot_count; i++) {
+        free(thread_snapshots[i]);
+        thread_snapshots[i] = NULL;
+    }
+    thread_snapshot_count = 0;
+}
+
+// ============================================================
 // Phase 3: Multi-threaded Test Functions
 // ============================================================
 
@@ -454,7 +661,9 @@ void* thread_worker_cpu(void* arg) {
     }
 
     printf("Thread %ld: CPU work done\n", syscall(SYS_gettid));
-    print_profiling_results();
+
+    // Phase 4: Register thread data before exiting
+    register_thread_data();
 
     return NULL;
 }
@@ -469,7 +678,9 @@ void* thread_worker_io(void* arg) {
     function_io_heavy();
 
     printf("Thread %ld: I/O work done\n", syscall(SYS_gettid));
-    print_profiling_results();
+
+    // Phase 4: Register thread data before exiting
+    register_thread_data();
 
     return NULL;
 }
@@ -486,7 +697,9 @@ void* thread_worker_sleep(void* arg) {
     }
 
     printf("Thread %ld: Sleep work done\n", syscall(SYS_gettid));
-    print_profiling_results();
+
+    // Phase 4: Register thread data before exiting
+    register_thread_data();
 
     return NULL;
 }
@@ -504,7 +717,9 @@ void* thread_worker_mixed(void* arg) {
     function_mixed();
 
     printf("Thread %ld: Mixed work done\n", syscall(SYS_gettid));
-    print_profiling_results();
+
+    // Phase 4: Register thread data before exiting
+    register_thread_data();
 
     return NULL;
 }
@@ -545,10 +760,44 @@ void run_single_threaded_tests() {
     print_profiling_results();
 }
 
-// Run multi-threaded tests (Phase 3)
+// Phase 4: Test with multiple threads calling same function
+void* thread_worker_shared(void* arg) {
+    long thread_num = (long)arg;  // Use long to avoid pointer size issues
+
+    // Each thread calls the same functions multiple times
+    for (int i = 0; i < thread_num + 1; i++) {
+        function_a();
+        function_cpu_heavy();
+    }
+
+    // Register thread data
+    register_thread_data();
+    return NULL;
+}
+
+void run_shared_function_test() {
+    printf("\n========================================\n");
+    printf("Shared Function Test (Phase 4)\n");
+    printf("========================================\n");
+    printf("Testing multiple threads calling same functions...\n\n");
+
+    pthread_t threads[4];
+
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&threads[i], NULL, thread_worker_shared, (void*)(long)(i + 1));
+    }
+
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    printf("All threads completed!\n");
+}
+
+// Run multi-threaded tests (Phase 3/4)
 void run_multi_threaded_tests() {
     printf("\n========================================\n");
-    printf("Multi-threaded Tests (Phase 3)\n");
+    printf("Multi-threaded Tests (Phase 3/4)\n");
     printf("========================================\n");
     printf("Creating 4 threads with different workloads...\n\n");
 
@@ -584,16 +833,43 @@ int main(int argc, char* argv[]) {
     printf("simple_gprof - Multi-threaded Profiler Demo\n");
     printf("==============================================\n");
 
-    start_profiling();
-
-    // Check command line argument for test mode
+    // Phase 4: Parse command line arguments
     int multi_threaded = 0;
-    if (argc > 1 && strcmp(argv[1], "--multi-threaded") == 0) {
-        multi_threaded = 1;
+    int shared_test = 0;
+    char report_mode[32] = "per-thread";  // default: per-thread, options: merged, both
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--multi-threaded") == 0) {
+            multi_threaded = 1;
+        } else if (strcmp(argv[i], "--shared-test") == 0) {
+            shared_test = 1;
+            multi_threaded = 1;  // Shared test requires multi-threading
+        } else if (strncmp(argv[i], "--report-mode=", 14) == 0) {
+            strncpy(report_mode, argv[i] + 14, 31);
+        } else if (strcmp(argv[i], "--help") == 0) {
+            printf("\nUsage: %s [options]\n", argv[0]);
+            printf("Options:\n");
+            printf("  --multi-threaded         Run multi-threaded tests\n");
+            printf("  --shared-test            Run shared function test (multiple threads call same functions)\n");
+            printf("  --report-mode=MODE       Report mode: per-thread, merged, or both (default: per-thread)\n");
+            printf("  --help                   Show this help message\n\n");
+            printf("Examples:\n");
+            printf("  %s                                    # Single-threaded test\n", argv[0]);
+            printf("  %s --multi-threaded                   # Multi-threaded test, per-thread reports\n", argv[0]);
+            printf("  %s --multi-threaded --report-mode=merged  # Multi-threaded test, merged report\n", argv[0]);
+            printf("  %s --shared-test --report-mode=both   # Shared function test, both reports\n", argv[0]);
+            printf("\n");
+            return 0;
+        }
     }
 
-    if (multi_threaded) {
-        // Phase 3: Multi-threaded tests
+    start_profiling();
+
+    if (shared_test) {
+        // Phase 4: Shared function test
+        run_shared_function_test();
+    } else if (multi_threaded) {
+        // Phase 3/4: Multi-threaded tests
         run_multi_threaded_tests();
     } else {
         // Default: Single-threaded tests
@@ -601,6 +877,29 @@ int main(int argc, char* argv[]) {
     }
 
     stop_profiling();
+
+    // Phase 4: Generate reports based on mode
+    if (multi_threaded || shared_test) {
+        // Add main thread data if it has profiling data
+        if (function_count > 0) {
+            register_thread_data();
+        }
+
+        if (strcmp(report_mode, "per-thread") == 0) {
+            print_per_thread_reports();
+        } else if (strcmp(report_mode, "merged") == 0) {
+            print_merged_report();
+        } else if (strcmp(report_mode, "both") == 0) {
+            print_per_thread_reports();
+            print_merged_report();
+        } else {
+            printf("Unknown report mode: %s\n", report_mode);
+            printf("Using default: per-thread\n");
+            print_per_thread_reports();
+        }
+
+        cleanup_thread_snapshots();
+    }
 
     printf("\nProfiling stopped.\n");
 

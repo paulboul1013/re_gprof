@@ -1959,12 +1959,540 @@ pthread_detach(thread_id);  // 執行緒結束自動清理,無需 join
 
 ---
 
+---
+
+## Phase 4: 多執行緒報表輸出 (已完成)
+
+**完成日期**: 2026-01-26
+
+### 1. TLS 資料收集的挑戰
+
+#### 問題描述
+
+Phase 3 使用 TLS (`__thread`) 隔離各執行緒的 profiling 資料:
+
+```c
+__thread function_info_t functions[MAX_FUNCTIONS];
+__thread time_stamp caller_counts[MAX_FUNCTIONS][MAX_FUNCTIONS];
+```
+
+**問題**: TLS 變數是執行緒私有的,主執行緒無法直接存取其他執行緒的 TLS。
+
+```c
+// ❌ 這不可行！
+void main_thread() {
+    // 無法存取 Thread A 的 functions[]
+    // 無法存取 Thread B 的 functions[]
+}
+```
+
+#### 解決方案: 資料快照 (Snapshot)
+
+在執行緒結束前,將 TLS 資料複製到全域堆積記憶體:
+
+```c
+// 全域快照陣列 (所有執行緒共享)
+thread_data_snapshot_t* thread_snapshots[MAX_THREADS];
+int thread_snapshot_count = 0;
+pthread_mutex_t snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 執行緒快照結構
+typedef struct {
+    pid_t thread_id;
+    int function_count;
+    function_info_t functions[MAX_FUNCTIONS];       // 複製 TLS
+    time_stamp caller_counts[MAX_FUNCTIONS][MAX_FUNCTIONS];  // 複製 TLS
+} thread_data_snapshot_t;
+```
+
+---
+
+### 2. 資料收集機制實作
+
+#### register_thread_data() 函數
+
+每個執行緒在結束前呼叫此函數,將 TLS 資料快照到全域:
+
+```c
+void register_thread_data() {
+    pid_t tid = current_thread_id ? current_thread_id : syscall(SYS_gettid);
+
+    // 跳過沒有 profiling 資料的執行緒
+    if (function_count == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&snapshot_mutex);
+
+    // 動態分配快照記憶體
+    thread_data_snapshot_t* snapshot = malloc(sizeof(thread_data_snapshot_t));
+
+    // 複製 TLS 資料
+    snapshot->thread_id = tid;
+    snapshot->function_count = function_count;
+    memcpy(snapshot->functions, functions, sizeof(functions));
+    memcpy(snapshot->caller_counts, caller_counts, sizeof(caller_counts));
+
+    // 加入全域快照列表
+    thread_snapshots[thread_snapshot_count++] = snapshot;
+
+    pthread_mutex_unlock(&snapshot_mutex);
+}
+```
+
+**關鍵點**:
+- 使用 `malloc()` 動態分配,確保資料在執行緒結束後仍存在
+- 使用 `memcpy()` 複製整個陣列 (深拷貝)
+- Mutex 保護全域陣列,避免 race condition
+
+#### 執行緒 Worker 函數修改
+
+```c
+void* thread_worker_cpu(void* arg) {
+    PROFILE_SCOPE("thread_worker_cpu");
+
+    // ... 執行工作 ...
+    function_cpu_heavy();
+
+    // Phase 4: 結束前註冊資料
+    register_thread_data();
+
+    return NULL;
+}
+```
+
+---
+
+### 3. 分執行緒報表實作
+
+#### print_per_thread_reports() 函數
+
+遍歷所有快照,為每個執行緒產生獨立報表:
+
+```c
+void print_per_thread_reports() {
+    printf("================================================================================\n");
+    printf("Per-Thread Profiling Reports (Phase 4)\n");
+    printf("Total threads: %d\n", thread_snapshot_count);
+
+    for (int i = 0; i < thread_snapshot_count; i++) {
+        print_thread_report(thread_snapshots[i]);
+    }
+}
+
+void print_thread_report(thread_data_snapshot_t* snapshot) {
+    printf("\n=== Thread %d Report ===\n", snapshot->thread_id);
+
+    // 列印此執行緒的所有函數統計
+    for (int i = 0; i < snapshot->function_count; i++) {
+        if (snapshot->functions[i].call_count > 0) {
+            printf("%-30s %10llu ...\n",
+                snapshot->functions[i].name,
+                snapshot->functions[i].call_count);
+        }
+    }
+}
+```
+
+**輸出範例**:
+```
+=== Thread 12345 Report ===
+Function                  Calls  Total(ms)  User(s)  ...
+function_cpu_heavy            3      47.14    0.0467  ...
+
+=== Thread 12346 Report ===
+Function                  Calls  Total(ms)  User(s)  ...
+function_io_heavy             1    2066.25    0.0042  ...
+```
+
+---
+
+### 4. 合併報表實作
+
+#### 資料彙總演算法
+
+合併報表需要將所有執行緒的相同函數資料累加:
+
+```c
+typedef struct {
+    char name[256];
+    time_stamp total_time;      // 累加所有執行緒
+    time_stamp self_time;
+    time_stamp user_time;
+    time_stamp sys_time;
+    time_stamp wait_time;
+    time_stamp call_count;      // 累加所有執行緒
+    int thread_count;           // 有多少執行緒呼叫此函數
+} merged_function_t;
+```
+
+#### print_merged_report() 實作
+
+```c
+void print_merged_report() {
+    // 1. 建立合併資料結構
+    merged_function_t merged[MAX_GLOBAL_FUNCTIONS];
+    memset(merged, 0, sizeof(merged));
+
+    // 2. 初始化函數名稱 (從全域註冊表)
+    for (int i = 0; i < global_function_count; i++) {
+        strncpy(merged[i].name, global_function_registry[i].name, 255);
+    }
+
+    // 3. 遍歷所有執行緒快照
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        thread_data_snapshot_t* snapshot = thread_snapshots[t];
+
+        // 4. 遍歷此執行緒的所有函數
+        for (int f = 0; f < snapshot->function_count; f++) {
+            if (snapshot->functions[f].call_count == 0) continue;
+
+            // 5. 找到對應的全域函數 ID
+            int global_id = find_global_function_id(snapshot->functions[f].name);
+
+            // 6. 累加資料
+            merged[global_id].total_time += snapshot->functions[f].total_time;
+            merged[global_id].user_time += snapshot->functions[f].user_time;
+            merged[global_id].sys_time += snapshot->functions[f].sys_time;
+            merged[global_id].wait_time += snapshot->functions[f].wait_time;
+            merged[global_id].call_count += snapshot->functions[f].call_count;
+            merged[global_id].thread_count++;  // 記錄執行緒數
+        }
+    }
+
+    // 7. 列印合併報表
+    for (int i = 0; i < global_function_count; i++) {
+        if (merged[i].call_count > 0) {
+            printf("%-30s %10llu %10d ...\n",
+                merged[i].name,
+                merged[i].call_count,
+                merged[i].thread_count);
+        }
+    }
+}
+```
+
+**輸出範例**:
+```
+Function                  Calls  Threads  Total(ms)  User(s)  ...
+function_a                   14        4      27.71    0.0242  ...
+function_cpu_heavy           14        4     217.85    0.2157  ...
+```
+
+**解讀**:
+- `function_a` 被呼叫 14 次,來自 4 個執行緒
+- 總時間 27.71ms 是所有執行緒的累加
+
+---
+
+### 5. Static __thread 變數問題
+
+#### 問題發現
+
+Phase 3 實作中,`PROFILE_FUNCTION()` 巨集使用 static 變數快取函數 ID:
+
+```c
+#define PROFILE_FUNCTION()                                  \
+    static int __func_id = -1;  /* ❌ 問題! */             \
+    if (__func_id == -1) {                                  \
+        __func_id = register_function(__func__);            \
+    }                                                       \
+    enter_function(__func_id);
+```
+
+**問題**: `static` 變數是全域共享的,但它儲存的是 thread-local 函數索引!
+
+**情境**:
+1. Thread A 呼叫 `function_a()`:
+   - `__func_id = -1` → 註冊,得到 `local_id = 0`
+   - `__func_id = 0` (全域變數!)
+
+2. Thread B 呼叫 `function_a()`:
+   - `__func_id = 0` (已被 Thread A 設置)
+   - 跳過註冊,直接使用 `func_id = 0`
+   - 但 Thread B 的 `functions[0]` 是空的! ❌
+
+**結果**: 只有第一個執行緒的資料被記錄。
+
+#### 解決方案
+
+將 `static` 改為 `static __thread`,讓每個執行緒有自己的快取:
+
+```c
+#define PROFILE_FUNCTION()                                  \
+    static __thread int __func_id = -1;  /* ✅ 修正! */    \
+    if (__func_id == -1) {                                  \
+        __func_id = register_function(__func__);            \
+    }                                                       \
+    enter_function(__func_id);
+```
+
+**效果**:
+- Thread A: `__func_id = 0` (Thread A 的 TLS)
+- Thread B: `__func_id = 0` (Thread B 的 TLS)
+- 兩者獨立,互不影響 ✅
+
+---
+
+### 6. 命令列參數解析
+
+#### 參數系統設計
+
+```c
+int main(int argc, char* argv[]) {
+    // 預設值
+    int multi_threaded = 0;
+    int shared_test = 0;
+    char report_mode[32] = "per-thread";
+
+    // 解析參數
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--multi-threaded") == 0) {
+            multi_threaded = 1;
+        } else if (strcmp(argv[i], "--shared-test") == 0) {
+            shared_test = 1;
+            multi_threaded = 1;
+        } else if (strncmp(argv[i], "--report-mode=", 14) == 0) {
+            strncpy(report_mode, argv[i] + 14, 31);
+        } else if (strcmp(argv[i], "--help") == 0) {
+            print_help();
+            return 0;
+        }
+    }
+
+    // 根據參數執行
+    if (strcmp(report_mode, "per-thread") == 0) {
+        print_per_thread_reports();
+    } else if (strcmp(report_mode, "merged") == 0) {
+        print_merged_report();
+    } else if (strcmp(report_mode, "both") == 0) {
+        print_per_thread_reports();
+        print_merged_report();
+    }
+}
+```
+
+#### 支援的參數
+
+| 參數 | 說明 |
+|------|------|
+| `--multi-threaded` | 執行多執行緒測試 |
+| `--shared-test` | 執行共享函數測試 |
+| `--report-mode=per-thread` | 顯示各執行緒獨立報表 |
+| `--report-mode=merged` | 顯示合併報表 |
+| `--report-mode=both` | 同時顯示兩種報表 |
+| `--help` | 顯示說明 |
+
+---
+
+### 7. 共享函數測試
+
+#### 測試目的
+
+驗證多個執行緒呼叫相同函數時,合併報表是否正確累加。
+
+#### 測試實作
+
+```c
+void* thread_worker_shared(void* arg) {
+    long thread_num = (long)arg;  // 1, 2, 3, 4
+
+    // 各執行緒呼叫不同次數
+    for (int i = 0; i < thread_num + 1; i++) {
+        function_a();
+        function_cpu_heavy();
+    }
+
+    register_thread_data();
+    return NULL;
+}
+
+void run_shared_function_test() {
+    pthread_t threads[4];
+
+    // Thread 1: 呼叫 2 次
+    // Thread 2: 呼叫 3 次
+    // Thread 3: 呼叫 4 次
+    // Thread 4: 呼叫 5 次
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&threads[i], NULL, thread_worker_shared, (void*)(long)(i + 1));
+    }
+
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+    }
+}
+```
+
+#### 驗證結果
+
+**Per-Thread 報表**:
+```
+=== Thread 80101 Report ===
+function_a            2 calls
+function_cpu_heavy    2 calls
+
+=== Thread 80108 Report ===
+function_a            3 calls
+function_cpu_heavy    3 calls
+
+=== Thread 80113 Report ===
+function_a            4 calls
+function_cpu_heavy    4 calls
+
+=== Thread 80119 Report ===
+function_a            5 calls
+function_cpu_heavy    5 calls
+```
+
+**Merged 報表**:
+```
+Function          Calls  Threads
+function_a           14        4    (2+3+4+5 = 14 ✅)
+function_cpu_heavy   14        4    (2+3+4+5 = 14 ✅)
+```
+
+**驗證通過**: 彙總正確!
+
+---
+
+### 8. 記憶體管理
+
+#### 動態分配與釋放
+
+```c
+// 分配快照
+thread_data_snapshot_t* snapshot = malloc(sizeof(thread_data_snapshot_t));
+
+// 使用快照...
+
+// 程式結束前釋放
+void cleanup_thread_snapshots() {
+    for (int i = 0; i < thread_snapshot_count; i++) {
+        free(thread_snapshots[i]);
+        thread_snapshots[i] = NULL;
+    }
+    thread_snapshot_count = 0;
+}
+```
+
+#### 為何使用動態分配?
+
+- TLS 變數在執行緒結束後被釋放
+- `malloc()` 分配的記憶體在堆積上,生命週期獨立於執行緒
+- 主執行緒可在所有執行緒結束後存取快照資料
+
+---
+
+### 9. 常見問題與除錯
+
+#### Q1: 為何只有第一個執行緒有資料?
+
+**原因**: `static` 變數沒有改為 `static __thread`。
+
+**檢查**:
+```c
+// ❌ 錯誤
+#define PROFILE_FUNCTION() \
+    static int __func_id = -1;
+
+// ✅ 正確
+#define PROFILE_FUNCTION() \
+    static __thread int __func_id = -1;
+```
+
+#### Q2: 合併報表的 Calls 不等於各執行緒總和?
+
+**可能原因**:
+- 某些執行緒沒有呼叫 `register_thread_data()`
+- 函數名稱對應錯誤 (global registry 問題)
+
+**除錯**:
+```c
+// 在 register_thread_data() 加入除錯輸出
+printf("Thread %d: Registered %d functions\n", tid, function_count);
+```
+
+#### Q3: 記憶體洩漏?
+
+確保呼叫 `cleanup_thread_snapshots()`:
+
+```c
+int main() {
+    // ...
+    print_merged_report();
+
+    cleanup_thread_snapshots();  // 必須呼叫!
+    return 0;
+}
+```
+
+---
+
+### 10. 學習心得與收穫
+
+#### 技術收穫
+
+1. **TLS 資料收集模式**:
+   - 執行緒結束前快照到全域堆積
+   - 使用 `malloc()` 確保資料持久性
+   - Mutex 保護全域快照陣列
+
+2. **資料彙總演算法**:
+   - 透過全域函數註冊表統一 ID
+   - 遍歷所有執行緒累加統計資料
+   - 記錄 thread_count 識別熱門函數
+
+3. **Static __thread 陷阱**:
+   - Static 變數是全域共享的
+   - 儲存 thread-local 索引會造成錯誤
+   - 必須使用 `static __thread` 確保執行緒隔離
+
+#### 實作經驗
+
+1. **命令列參數設計**:
+   - 使用 `--key=value` 格式
+   - 提供 `--help` 說明
+   - 預設值合理化
+
+2. **測試驗證**:
+   - Shared function test 驗證彙總正確性
+   - 數學驗證: 2+3+4+5 = 14 ✅
+   - 除錯輸出協助問題定位
+
+3. **報表設計**:
+   - Per-thread: 適合除錯單一執行緒
+   - Merged: 適合整體效能分析
+   - Both: 提供完整資訊
+
+#### 實際應用價值
+
+**Per-Thread 報表**:
+- 識別哪個執行緒最慢
+- 檢查執行緒負載是否平衡
+- 除錯特定執行緒的效能問題
+
+**Merged 報表**:
+- 識別整體熱點函數
+- Threads 欄位顯示「並行度」
+- 優化最常被呼叫的函數
+
+**範例**:
+```
+Function         Calls  Threads  Total(ms)
+send_request        1000       1    5000.00    ← 單執行緒瓶頸
+process_data        1000      10     100.00    ← 平行處理良好
+```
+
+---
+
 ## 下一步學習
 
-完成 **Phase 4: 多執行緒報表輸出** 後,將學習:
-- 如何收集所有執行緒的 TLS 資料
-- Thread ID 的管理與追蹤
-- 合併報表演算法
-- 分執行緒 vs 合併視圖的實作
+完成 **Phase 5: 動態記憶體與 Hash Table** 後,將學習:
+- Hash function 設計 (針對函數指標)
+- Collision resolution (Linear Probing vs Chaining)
+- Dynamic resizing 與 load factor
+- 記憶體管理與避免 memory leak
+- 移除靜態陣列限制,支援無限函數數量
 
-準備好開始下一階段了嗎? 請參考 `CLAUDE.md` 中的 Phase 4 實作項目!
+準備好開始下一階段了嗎? 請參考 `CLAUDE.md` 中的 Phase 5 實作項目!
