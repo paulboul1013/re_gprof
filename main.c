@@ -9,6 +9,8 @@
 #include <signal.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/syscall.h>  // For syscall(SYS_gettid)
 
 
 #define MAX_FUNCTIONS 1000
@@ -27,23 +29,41 @@ typedef struct {
     time_stamp wait_time;       // Wait time = wall - (user + sys) (microseconds)
     time_stamp call_count;
     int is_active;
+    pid_t thread_id;            // Thread ID (Phase 3)
     struct timespec start_wall_time; // Wall clock time at function entry (nanosecond precision)
     struct rusage start_rusage;      // Resource usage at function entry
 } function_info_t;
 
+// Global function name registry (shared across all threads)
+// Protected by mutex for thread-safe registration
+typedef struct {
+    char name[256];
+    int id;
+} function_registry_entry_t;
 
-static function_info_t functions[MAX_FUNCTIONS];
-static time_stamp caller_counts[MAX_FUNCTIONS][MAX_FUNCTIONS];
-static struct itimerval  timer;
-static int function_count=0;
-static int profiling_enabled=0;
+#define MAX_GLOBAL_FUNCTIONS 1000
+static function_registry_entry_t global_function_registry[MAX_GLOBAL_FUNCTIONS];
+static int global_function_count = 0;
+static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
+// Thread-local storage (Phase 3): Each thread has its own profiling data
+__thread function_info_t functions[MAX_FUNCTIONS];
+__thread time_stamp caller_counts[MAX_FUNCTIONS][MAX_FUNCTIONS];
+__thread int function_count = 0;
+__thread pid_t current_thread_id = 0;  // Cached thread ID
+
+// Global profiling control (shared across threads)
+static struct itimerval timer;
+static int profiling_enabled = 0;
 
 typedef struct {
     int stack[MAX_CALL_STACK];
     int top;
 } call_stack_t;
 
-static call_stack_t call_stack={.top=-1};
+// Thread-local call stack
+__thread call_stack_t call_stack = {.top = -1};
 
 
 void profiling_handler(int sig){
@@ -103,36 +123,77 @@ void stop_profiling() {
 
 }
 
+// Thread-safe function registration (Phase 3)
+// Step 1: Register in global registry (mutex-protected)
+// Step 2: Create thread-local entry
 int register_function(const char *name) {
     if (function_count >= MAX_FUNCTIONS) {
         return -1;
     }
 
-    strncpy(functions[function_count].name,name,255);
-    functions[function_count].total_time=0;
-    functions[function_count].self_time = 0;
-    functions[function_count].user_time = 0;
-    functions[function_count].sys_time = 0;
-    functions[function_count].wait_time = 0;
-    functions[function_count].call_count = 0;
-    functions[function_count].is_active = 0;
+    // Initialize thread ID on first registration
+    if (current_thread_id == 0) {
+        current_thread_id = syscall(SYS_gettid);
+    }
 
-    return function_count++;
+    // Thread-safe: Lock global registry to find or create function ID
+    pthread_mutex_lock(&registry_mutex);
 
+    int global_id = -1;
+    // Check if function already registered globally
+    for (int i = 0; i < global_function_count; i++) {
+        if (strcmp(global_function_registry[i].name, name) == 0) {
+            global_id = global_function_registry[i].id;
+            break;
+        }
+    }
+
+    // If not found, create new global entry
+    if (global_id == -1) {
+        if (global_function_count >= MAX_GLOBAL_FUNCTIONS) {
+            pthread_mutex_unlock(&registry_mutex);
+            return -1;
+        }
+        global_id = global_function_count;
+        strncpy(global_function_registry[global_function_count].name, name, 255);
+        global_function_registry[global_function_count].id = global_id;
+        global_function_count++;
+    }
+
+    pthread_mutex_unlock(&registry_mutex);
+
+    // Create thread-local entry
+    int local_id = function_count;
+    strncpy(functions[local_id].name, name, 255);
+    functions[local_id].total_time = 0;
+    functions[local_id].self_time = 0;
+    functions[local_id].user_time = 0;
+    functions[local_id].sys_time = 0;
+    functions[local_id].wait_time = 0;
+    functions[local_id].call_count = 0;
+    functions[local_id].is_active = 0;
+    functions[local_id].thread_id = current_thread_id;
+
+    function_count++;
+    return local_id;
 }
 
 void enter_function(int func_id) {
-    if (func_id < 0 || func_id>=function_count) return;
+    if (func_id < 0 || func_id >= function_count) return;
 
     functions[func_id].call_count++;
-    functions[func_id].is_active=1;
+    functions[func_id].is_active = 1;
 
     // Record wall clock time with nanosecond precision (Phase 2)
     clock_gettime(CLOCK_MONOTONIC, &functions[func_id].start_wall_time);
 
-    // Record resource usage at function entry (for user/system time tracking)
-    // Note: Using RUSAGE_SELF for now (single-threaded). Will switch to RUSAGE_THREAD in Phase 3.
-    getrusage(RUSAGE_SELF, &functions[func_id].start_rusage);
+    // Phase 3: Use RUSAGE_THREAD for per-thread CPU time tracking
+    // RUSAGE_THREAD requires _GNU_SOURCE and Linux 2.6.26+
+    #ifdef __linux__
+        getrusage(RUSAGE_THREAD, &functions[func_id].start_rusage);
+    #else
+        getrusage(RUSAGE_SELF, &functions[func_id].start_rusage);
+    #endif
 
     if (call_stack.top >= 0) {
         int caller_id = call_stack.stack[call_stack.top];
@@ -141,20 +202,26 @@ void enter_function(int func_id) {
         }
     }
 
-    if (call_stack.top < MAX_CALL_STACK-1){
-        call_stack.stack[++call_stack.top]=func_id;
+    if (call_stack.top < MAX_CALL_STACK - 1) {
+        call_stack.stack[++call_stack.top] = func_id;
     }
 }
 
 void leave_function(int func_id) {
-    if (func_id < 0 || func_id>=function_count) return;
+    if (func_id < 0 || func_id >= function_count) return;
 
     struct timespec end_wall_time;
     struct rusage end_rusage;
 
     // Get end timestamps
     clock_gettime(CLOCK_MONOTONIC, &end_wall_time);
-    getrusage(RUSAGE_SELF, &end_rusage);
+
+    // Phase 3: Use RUSAGE_THREAD for per-thread CPU time
+    #ifdef __linux__
+        getrusage(RUSAGE_THREAD, &end_rusage);
+    #else
+        getrusage(RUSAGE_SELF, &end_rusage);
+    #endif
 
     // Calculate wall time delta (convert timespec to microseconds)
     long long wall_delta = (end_wall_time.tv_sec - functions[func_id].start_wall_time.tv_sec) * 1000000LL +
@@ -190,7 +257,10 @@ void leave_function(int func_id) {
 
 
 void print_profiling_results() {
-    printf("\n=== Profiling Results (Phase 2: with Wait Time) ===\n");
+    // Get current thread ID for display
+    pid_t tid = current_thread_id ? current_thread_id : syscall(SYS_gettid);
+
+    printf("\n=== Profiling Results (Phase 3: Thread %d) ===\n", tid);
     printf("%-30s %10s %10s %10s %10s %10s %10s %10s %10s\n",
         "Function", "Calls", "Total(ms)", "Self(ms)", "User(s)", "Sys(s)", "Wait(s)", "Self%", "Total/call");
     printf("------------------------------------------------------------------------------------------------------------------------------------------\n");
@@ -368,30 +438,91 @@ void function_mixed() {
     nanosleep(&ts, NULL);
 }
 
-int main(){
+// ============================================================
+// Phase 3: Multi-threaded Test Functions
+// ============================================================
 
+// Thread worker 1: CPU-intensive
+void* thread_worker_cpu(void* arg) {
+    PROFILE_SCOPE("thread_worker_cpu");
 
-    init_profilier();
-    
-#ifndef AUTO_PROFILE
-    register_function("main");
-    register_function("function_a");
-    register_function("function_b");
-    register_function("function_c");
-#endif
+    printf("Thread %ld: Starting CPU-intensive work\n", syscall(SYS_gettid));
 
-    printf("Start  profiling...\n");
-    printf("Testing User/System time separation...\n");
-    start_profiling();
+    // Perform CPU-heavy work
+    for (int i = 0; i < 3; i++) {
+        function_cpu_heavy();
+    }
+
+    printf("Thread %ld: CPU work done\n", syscall(SYS_gettid));
+    print_profiling_results();
+
+    return NULL;
+}
+
+// Thread worker 2: I/O-intensive
+void* thread_worker_io(void* arg) {
+    PROFILE_SCOPE("thread_worker_io");
+
+    printf("Thread %ld: Starting I/O-intensive work\n", syscall(SYS_gettid));
+
+    // Perform I/O-heavy work
+    function_io_heavy();
+
+    printf("Thread %ld: I/O work done\n", syscall(SYS_gettid));
+    print_profiling_results();
+
+    return NULL;
+}
+
+// Thread worker 3: Sleep-heavy
+void* thread_worker_sleep(void* arg) {
+    PROFILE_SCOPE("thread_worker_sleep");
+
+    printf("Thread %ld: Starting sleep work\n", syscall(SYS_gettid));
+
+    // Multiple sleeps
+    for (int i = 0; i < 5; i++) {
+        function_sleep_test();
+    }
+
+    printf("Thread %ld: Sleep work done\n", syscall(SYS_gettid));
+    print_profiling_results();
+
+    return NULL;
+}
+
+// Thread worker 4: Mixed workload
+void* thread_worker_mixed(void* arg) {
+    PROFILE_SCOPE("thread_worker_mixed");
+
+    printf("Thread %ld: Starting mixed work\n", syscall(SYS_gettid));
+
+    // Call various functions
+    function_a();
+    function_b();
+    function_c();
+    function_mixed();
+
+    printf("Thread %ld: Mixed work done\n", syscall(SYS_gettid));
+    print_profiling_results();
+
+    return NULL;
+}
+
+// Run single-threaded tests (Phase 0, 1, 2)
+void run_single_threaded_tests() {
+    printf("\n========================================\n");
+    printf("Single-threaded Tests (Phase 0, 1, 2)\n");
+    printf("========================================\n");
 
     // Original CPU-intensive tests
-    for (int i=0;i<3;i++){
+    for (int i = 0; i < 3; i++) {
         PROFILE_SCOPE("main_loop");
         function_a();
         function_b();
         function_c();
 
-        for (volatile int j=0;j<1000000;j++);
+        for (volatile int j = 0; j < 1000000; j++);
     }
 
     // Phase 1 tests: User vs System time
@@ -411,12 +542,67 @@ int main(){
     printf("Running mixed workload test (CPU + I/O + Sleep)...\n");
     function_mixed();
 
-    stop_profiling();
-    
-
     print_profiling_results();
+}
 
-    printf("profiling  stopped.\n");
+// Run multi-threaded tests (Phase 3)
+void run_multi_threaded_tests() {
+    printf("\n========================================\n");
+    printf("Multi-threaded Tests (Phase 3)\n");
+    printf("========================================\n");
+    printf("Creating 4 threads with different workloads...\n\n");
+
+    pthread_t threads[4];
+
+    // Create 4 threads with different workloads
+    pthread_create(&threads[0], NULL, thread_worker_cpu, NULL);
+    pthread_create(&threads[1], NULL, thread_worker_io, NULL);
+    pthread_create(&threads[2], NULL, thread_worker_sleep, NULL);
+    pthread_create(&threads[3], NULL, thread_worker_mixed, NULL);
+
+    // Wait for all threads to complete
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    printf("\n========================================\n");
+    printf("All threads completed!\n");
+    printf("========================================\n");
+}
+
+int main(int argc, char* argv[]) {
+    init_profilier();
+
+#ifndef AUTO_PROFILE
+    register_function("main");
+    register_function("function_a");
+    register_function("function_b");
+    register_function("function_c");
+#endif
+
+    printf("==============================================\n");
+    printf("simple_gprof - Multi-threaded Profiler Demo\n");
+    printf("==============================================\n");
+
+    start_profiling();
+
+    // Check command line argument for test mode
+    int multi_threaded = 0;
+    if (argc > 1 && strcmp(argv[1], "--multi-threaded") == 0) {
+        multi_threaded = 1;
+    }
+
+    if (multi_threaded) {
+        // Phase 3: Multi-threaded tests
+        run_multi_threaded_tests();
+    } else {
+        // Default: Single-threaded tests
+        run_single_threaded_tests();
+    }
+
+    stop_profiling();
+
+    printf("\nProfiling stopped.\n");
 
     return 0;
 }
