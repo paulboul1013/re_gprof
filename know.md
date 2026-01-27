@@ -2496,3 +2496,51 @@ process_data        1000      10     100.00    ← 平行處理良好
 - 移除靜態陣列限制,支援無限函數數量
 
 準備好開始下一階段了嗎? 請參考 `CLAUDE.md` 中的 Phase 5 實作項目!
+
+---
+
+## Phase 8: 視覺化輸出 (已完成)
+
+**完成日期**: 2026-01-27
+
+### 核心成果
+
+實作了 Graphviz DOT 格式輸出，支援：
+- Per-thread 模式：使用 subgraph cluster 分組顯示各執行緒
+- Merged 模式：彙總所有執行緒資料
+- 顏色編碼：紅色(>20%) → 橙色(>10%) → 黃色(>5%) → 綠色(>1%) → 藍色(≤1%)
+- 呼叫次數標註在邊上
+- 自動產生 PNG 圖片
+
+### 實際成果
+
+```bash
+$ ./main --multi-threaded --export-dot
+Merged call graph exported to callgraph_merged.dot
+Generate image with: dot -Tpng callgraph_merged.dot -o callgraph_merged.png
+
+$ dot -Tpng callgraph_merged.dot -o callgraph_merged.png
+```
+
+視覺化效果：
+- `function_io_heavy`: 97.9% (紅色) ← 一眼看出瓶頸
+- `function_cpu_heavy`: 1.9% (淺綠) ← 次要熱點
+
+---
+
+## 總結
+
+**已完成階段**:
+- Phase 0: 基礎原型
+- Phase 1: User/System Time 分離
+- Phase 2: I/O Wait Time 估算
+- Phase 3: 多執行緒支援 (TLS)
+- Phase 4: 多執行緒報表輸出
+- Phase 8: 視覺化輸出 (Graphviz)
+
+**未完成階段** (可作為未來擴展):
+- Phase 5: 動態記憶體與 Hash Table
+- Phase 6: gmon.out 格式輸出
+- Phase 7: ELF 符號解析
+
+專案已具備實用的 profiling 和視覺化功能！

@@ -646,6 +646,225 @@ void cleanup_thread_snapshots() {
 }
 
 // ============================================================
+// Phase 8: Graphviz DOT Format Output
+// ============================================================
+
+// Generate color based on percentage (hot = red, cold = blue)
+static const char* get_color_for_percentage(double percent) {
+    if (percent > 20.0) return "#FF0000";      // Red - very hot
+    if (percent > 10.0) return "#FF8800";      // Orange - hot
+    if (percent > 5.0) return "#FFFF00";       // Yellow - warm
+    if (percent > 1.0) return "#88FF88";       // Light green - cool
+    return "#AAAAFF";                          // Light blue - cold
+}
+
+// Export call graph to DOT format (per-thread)
+void export_dot_per_thread(const char* filename) {
+    FILE* fp = fopen(filename, "w");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot create %s\n", filename);
+        return;
+    }
+
+    fprintf(fp, "digraph CallGraph {\n");
+    fprintf(fp, "    rankdir=LR;\n");
+    fprintf(fp, "    node [shape=box, style=filled];\n");
+    fprintf(fp, "    \n");
+
+    // Calculate total self time for percentage
+    time_stamp total_self_time = 0;
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        for (int i = 0; i < thread_snapshots[t]->function_count; i++) {
+            total_self_time += thread_snapshots[t]->functions[i].self_time;
+        }
+    }
+
+    // Add nodes (functions) for each thread
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        thread_data_snapshot_t* snapshot = thread_snapshots[t];
+
+        fprintf(fp, "    // Thread %d\n", snapshot->thread_id);
+        fprintf(fp, "    subgraph cluster_%d {\n", snapshot->thread_id);
+        fprintf(fp, "        label=\"Thread %d\";\n", snapshot->thread_id);
+        fprintf(fp, "        style=dashed;\n");
+
+        for (int i = 0; i < snapshot->function_count; i++) {
+            if (snapshot->functions[i].call_count == 0) continue;
+
+            double percent = (total_self_time > 0) ?
+                (snapshot->functions[i].self_time * 100.0 / total_self_time) : 0;
+            const char* color = get_color_for_percentage(percent);
+
+            fprintf(fp, "        \"T%d_%s\" [label=\"%s\\n%.1f%%\\n%llu calls\", fillcolor=\"%s\"];\n",
+                snapshot->thread_id,
+                snapshot->functions[i].name,
+                snapshot->functions[i].name,
+                percent,
+                snapshot->functions[i].call_count,
+                color);
+        }
+
+        fprintf(fp, "    }\n\n");
+    }
+
+    // Add edges (caller -> callee)
+    fprintf(fp, "    // Call relationships\n");
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        thread_data_snapshot_t* snapshot = thread_snapshots[t];
+
+        for (int caller = 0; caller < snapshot->function_count; caller++) {
+            if (snapshot->functions[caller].call_count == 0) continue;
+
+            for (int callee = 0; callee < snapshot->function_count; callee++) {
+                time_stamp count = snapshot->caller_counts[caller][callee];
+                if (count > 0) {
+                    fprintf(fp, "    \"T%d_%s\" -> \"T%d_%s\" [label=\"%llu\"];\n",
+                        snapshot->thread_id,
+                        snapshot->functions[caller].name,
+                        snapshot->thread_id,
+                        snapshot->functions[callee].name,
+                        count);
+                }
+            }
+        }
+    }
+
+    fprintf(fp, "}\n");
+    fclose(fp);
+
+    printf("Call graph exported to %s\n", filename);
+    printf("Generate image with: dot -Tpng %s -o callgraph.png\n", filename);
+}
+
+// Export merged call graph to DOT format
+void export_dot_merged(const char* filename) {
+    FILE* fp = fopen(filename, "w");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot create %s\n", filename);
+        return;
+    }
+
+    fprintf(fp, "digraph MergedCallGraph {\n");
+    fprintf(fp, "    rankdir=LR;\n");
+    fprintf(fp, "    node [shape=box, style=filled];\n");
+    fprintf(fp, "    \n");
+
+    // Merged function data
+    typedef struct {
+        char name[256];
+        time_stamp self_time;
+        time_stamp call_count;
+        int thread_count;
+    } merged_func_t;
+
+    merged_func_t merged[MAX_GLOBAL_FUNCTIONS];
+    memset(merged, 0, sizeof(merged));
+
+    // Initialize from global registry
+    for (int i = 0; i < global_function_count; i++) {
+        strncpy(merged[i].name, global_function_registry[i].name, 255);
+    }
+
+    // Aggregate data
+    time_stamp total_self_time = 0;
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        for (int f = 0; f < thread_snapshots[t]->function_count; f++) {
+            if (thread_snapshots[t]->functions[f].call_count == 0) continue;
+
+            int global_id = -1;
+            for (int g = 0; g < global_function_count; g++) {
+                if (strcmp(thread_snapshots[t]->functions[f].name, global_function_registry[g].name) == 0) {
+                    global_id = g;
+                    break;
+                }
+            }
+
+            if (global_id >= 0) {
+                merged[global_id].self_time += thread_snapshots[t]->functions[f].self_time;
+                merged[global_id].call_count += thread_snapshots[t]->functions[f].call_count;
+                merged[global_id].thread_count++;
+                total_self_time += thread_snapshots[t]->functions[f].self_time;
+            }
+        }
+    }
+
+    // Add nodes
+    fprintf(fp, "    // Functions (merged from all threads)\n");
+    for (int i = 0; i < global_function_count; i++) {
+        if (merged[i].call_count == 0) continue;
+
+        double percent = (total_self_time > 0) ?
+            (merged[i].self_time * 100.0 / total_self_time) : 0;
+        const char* color = get_color_for_percentage(percent);
+
+        fprintf(fp, "    \"%s\" [label=\"%s\\n%.1f%%\\n%llu calls\\n%d threads\", fillcolor=\"%s\"];\n",
+            merged[i].name,
+            merged[i].name,
+            percent,
+            merged[i].call_count,
+            merged[i].thread_count,
+            color);
+    }
+
+    // Aggregate caller-callee relationships
+    typedef struct {
+        char caller[256];
+        char callee[256];
+        time_stamp count;
+    } call_edge_t;
+
+    call_edge_t edges[10000];  // Assume max 10k edges
+    int edge_count = 0;
+
+    for (int t = 0; t < thread_snapshot_count; t++) {
+        thread_data_snapshot_t* snapshot = thread_snapshots[t];
+
+        for (int caller = 0; caller < snapshot->function_count; caller++) {
+            if (snapshot->functions[caller].call_count == 0) continue;
+
+            for (int callee = 0; callee < snapshot->function_count; callee++) {
+                time_stamp count = snapshot->caller_counts[caller][callee];
+                if (count == 0) continue;
+
+                // Find or create edge
+                int found = -1;
+                for (int e = 0; e < edge_count; e++) {
+                    if (strcmp(edges[e].caller, snapshot->functions[caller].name) == 0 &&
+                        strcmp(edges[e].callee, snapshot->functions[callee].name) == 0) {
+                        found = e;
+                        break;
+                    }
+                }
+
+                if (found >= 0) {
+                    edges[found].count += count;
+                } else if (edge_count < 10000) {
+                    strncpy(edges[edge_count].caller, snapshot->functions[caller].name, 255);
+                    strncpy(edges[edge_count].callee, snapshot->functions[callee].name, 255);
+                    edges[edge_count].count = count;
+                    edge_count++;
+                }
+            }
+        }
+    }
+
+    // Add edges
+    fprintf(fp, "\n    // Call relationships\n");
+    for (int i = 0; i < edge_count; i++) {
+        fprintf(fp, "    \"%s\" -> \"%s\" [label=\"%llu\"];\n",
+            edges[i].caller,
+            edges[i].callee,
+            edges[i].count);
+    }
+
+    fprintf(fp, "}\n");
+    fclose(fp);
+
+    printf("Merged call graph exported to %s\n", filename);
+    printf("Generate image with: dot -Tpng %s -o callgraph_merged.png\n", filename);
+}
+
+// ============================================================
 // Phase 3: Multi-threaded Test Functions
 // ============================================================
 
@@ -833,10 +1052,12 @@ int main(int argc, char* argv[]) {
     printf("simple_gprof - Multi-threaded Profiler Demo\n");
     printf("==============================================\n");
 
-    // Phase 4: Parse command line arguments
+    // Phase 4/8: Parse command line arguments
     int multi_threaded = 0;
     int shared_test = 0;
+    int export_dot = 0;  // Phase 8: Export call graph to DOT format
     char report_mode[32] = "per-thread";  // default: per-thread, options: merged, both
+    char dot_mode[32] = "merged";  // Phase 8: per-thread or merged
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--multi-threaded") == 0) {
@@ -846,18 +1067,26 @@ int main(int argc, char* argv[]) {
             multi_threaded = 1;  // Shared test requires multi-threading
         } else if (strncmp(argv[i], "--report-mode=", 14) == 0) {
             strncpy(report_mode, argv[i] + 14, 31);
+        } else if (strcmp(argv[i], "--export-dot") == 0) {
+            export_dot = 1;  // Phase 8: Enable DOT export
+        } else if (strncmp(argv[i], "--dot-mode=", 11) == 0) {
+            strncpy(dot_mode, argv[i] + 11, 31);  // Phase 8: per-thread or merged
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("\nUsage: %s [options]\n", argv[0]);
             printf("Options:\n");
             printf("  --multi-threaded         Run multi-threaded tests\n");
             printf("  --shared-test            Run shared function test (multiple threads call same functions)\n");
             printf("  --report-mode=MODE       Report mode: per-thread, merged, or both (default: per-thread)\n");
+            printf("  --export-dot             Export call graph to Graphviz DOT format (Phase 8)\n");
+            printf("  --dot-mode=MODE          DOT export mode: per-thread or merged (default: merged)\n");
             printf("  --help                   Show this help message\n\n");
             printf("Examples:\n");
             printf("  %s                                    # Single-threaded test\n", argv[0]);
             printf("  %s --multi-threaded                   # Multi-threaded test, per-thread reports\n", argv[0]);
             printf("  %s --multi-threaded --report-mode=merged  # Multi-threaded test, merged report\n", argv[0]);
             printf("  %s --shared-test --report-mode=both   # Shared function test, both reports\n", argv[0]);
+            printf("  %s --multi-threaded --export-dot      # Export merged call graph to DOT\n", argv[0]);
+            printf("  %s --multi-threaded --export-dot --dot-mode=per-thread  # Export per-thread call graphs\n", argv[0]);
             printf("\n");
             return 0;
         }
@@ -896,6 +1125,23 @@ int main(int argc, char* argv[]) {
             printf("Unknown report mode: %s\n", report_mode);
             printf("Using default: per-thread\n");
             print_per_thread_reports();
+        }
+
+        // Phase 8: Export call graph to DOT format
+        if (export_dot) {
+            printf("\n");
+            printf("================================================================================\n");
+            printf("Exporting Call Graph (Phase 8)\n");
+            printf("================================================================================\n");
+
+            if (strcmp(dot_mode, "per-thread") == 0) {
+                export_dot_per_thread("callgraph_per_thread.dot");
+            } else if (strcmp(dot_mode, "merged") == 0) {
+                export_dot_merged("callgraph_merged.dot");
+            } else {
+                printf("Unknown DOT mode: %s, using merged\n", dot_mode);
+                export_dot_merged("callgraph_merged.dot");
+            }
         }
 
         cleanup_thread_snapshots();

@@ -1,3 +1,6 @@
 .claude/
-CLAUDE.md
 main
+*.dot
+*.png
+*.o
+test*.tmp
