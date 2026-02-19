@@ -11,6 +11,14 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/syscall.h>  // For syscall(SYS_gettid)
+#include <dlfcn.h>        // Phase 6: dladdr() for function address lookup
+#include <stdint.h>       // Phase 6: uintptr_t
+
+// Phase 6: gmon.out format constants
+#define GMON_MAGIC      "gmon"
+#define GMON_VERSION    1
+#define GMON_TAG_TIME_HIST  0
+#define GMON_TAG_CG_ARC     1
 
 
 #define MAX_FUNCTIONS 1000
@@ -22,6 +30,7 @@ typedef unsigned long long time_stamp;
 
 typedef struct {
     char name[256];
+    void* addr;                 // Phase 6: Function start address (from dladdr)
     time_stamp total_time;      // Wall clock time (microseconds)
     time_stamp self_time;       // Sampling time (microseconds)
     time_stamp user_time;       // User mode CPU time (microseconds)
@@ -446,6 +455,17 @@ const char* register_function(const char *name) {
     if (func && func->call_count == 0) {
         // Initialize new function entry
         func->thread_id = current_thread_id;
+
+        // Phase 6: Capture function start address using __builtin_return_address
+        // __builtin_return_address(0) points into the calling function's body,
+        // allowing dladdr() to resolve the symbol's start address.
+        if (func->addr == NULL) {
+            void* ret_addr = __builtin_return_address(0);
+            Dl_info dl_info;
+            if (dladdr(ret_addr, &dl_info) && dl_info.dli_saddr != NULL) {
+                func->addr = dl_info.dli_saddr;
+            }
+        }
     }
 
     return name;
@@ -1270,6 +1290,254 @@ void export_dot_merged(const char* filename) {
 }
 
 // ============================================================
+// Phase 6: gmon.out Binary Format Export
+// ============================================================
+
+// Write gmon.out for current data.
+// use_merged=0: single-threaded (uses TLS functions/caller_counts)
+// use_merged=1: multi-threaded merged (uses thread_snapshots)
+void export_gmon_out(const char* filename, int use_merged) {
+    // -------- Collect function data --------
+    // We aggregate all functions into a temporary list for address scan
+    // and histogram building.
+
+    // Build a flat array of (addr, self_time_us) for histogram
+    // and iterate caller_counts for arc records.
+
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("export_gmon_out: fopen");
+        return;
+    }
+
+    // -------- Step 1: Write header (20 bytes) --------
+    // magic: "gmon" (4 bytes)
+    fwrite(GMON_MAGIC, 4, 1, fp);
+    // version: 1 (4 bytes, little-endian native)
+    uint32_t version = GMON_VERSION;
+    fwrite(&version, sizeof(uint32_t), 1, fp);
+    // spare: 12 bytes of zeros
+    char spare[12] = {0};
+    fwrite(spare, 12, 1, fp);
+
+    // -------- Step 2: Find PC range and collect function info --------
+    uintptr_t low_pc = UINTPTR_MAX;
+    uintptr_t high_pc = 0;
+
+    // Collect addresses from appropriate source
+    if (use_merged && thread_snapshot_count > 0) {
+        pthread_mutex_lock(&snapshot_mutex);
+        for (int t = 0; t < thread_snapshot_count; t++) {
+            hash_table_t* ht = thread_snapshots[t]->functions;
+            if (!ht) continue;
+            for (int i = 0; i < ht->capacity; i++) {
+                hash_entry_t* entry = ht->buckets[i];
+                while (entry) {
+                    if (entry->value.addr) {
+                        uintptr_t a = (uintptr_t)entry->value.addr;
+                        if (a < low_pc) low_pc = a;
+                        if (a > high_pc) high_pc = a;
+                    }
+                    entry = entry->next;
+                }
+            }
+        }
+        pthread_mutex_unlock(&snapshot_mutex);
+    } else if (!use_merged && functions) {
+        for (int i = 0; i < functions->capacity; i++) {
+            hash_entry_t* entry = functions->buckets[i];
+            while (entry) {
+                if (entry->value.addr) {
+                    uintptr_t a = (uintptr_t)entry->value.addr;
+                    if (a < low_pc) low_pc = a;
+                    if (a > high_pc) high_pc = a;
+                }
+                entry = entry->next;
+            }
+        }
+    }
+
+    if (low_pc == UINTPTR_MAX || high_pc == 0 || high_pc <= low_pc) {
+        // No valid addresses: skip histogram, write empty file
+        fprintf(stderr, "export_gmon_out: no valid function addresses found\n");
+        fclose(fp);
+        return;
+    }
+
+    // Add padding at end of address range to cover last function's body
+    high_pc += 0x1000;
+
+    // -------- Step 3: Build histogram --------
+    // Standard gmon uses HISTFRACTION = 2 bytes per bin
+    const int BIN_BYTES = 2;
+    const uint32_t PROF_RATE = 100;  // 100 Hz = 10ms interval
+    uintptr_t addr_range = high_pc - low_pc;
+
+    // Cap number of bins to avoid excessive memory
+    int num_bins = (int)(addr_range / BIN_BYTES);
+    if (num_bins > 65536) {
+        num_bins = 65536;
+    }
+    if (num_bins <= 0) num_bins = 1;
+
+    // NOTE: gmon.out stores hist_size as the COUNT of bins, not byte size
+    uint32_t hist_size = (uint32_t)num_bins;
+
+    uint16_t* hist = (uint16_t*)calloc(num_bins, sizeof(uint16_t));
+    if (!hist) {
+        fprintf(stderr, "export_gmon_out: out of memory for histogram\n");
+        fclose(fp);
+        return;
+    }
+
+    // Distribute self_time samples across histogram bins
+    // Each sample = PROFILING_INTERVAL us = 10000 us
+    double actual_bin_bytes = (double)addr_range / num_bins;
+
+    if (use_merged && thread_snapshot_count > 0) {
+        pthread_mutex_lock(&snapshot_mutex);
+        for (int t = 0; t < thread_snapshot_count; t++) {
+            hash_table_t* ht = thread_snapshots[t]->functions;
+            if (!ht) continue;
+            for (int i = 0; i < ht->capacity; i++) {
+                hash_entry_t* entry = ht->buckets[i];
+                while (entry) {
+                    if (entry->value.addr && entry->value.self_time > 0) {
+                        uintptr_t a = (uintptr_t)entry->value.addr;
+                        int bin = (int)((a - low_pc) / actual_bin_bytes);
+                        if (bin < 0) bin = 0;
+                        if (bin >= num_bins) bin = num_bins - 1;
+                        // Convert self_time (microseconds) to sample count
+                        long long samples = (long long)(entry->value.self_time / PROFILING_INTERVAL);
+                        if (samples > 65535) samples = 65535;
+                        hist[bin] = (uint16_t)(hist[bin] + samples > 65535 ? 65535 : hist[bin] + samples);
+                    }
+                    entry = entry->next;
+                }
+            }
+        }
+        pthread_mutex_unlock(&snapshot_mutex);
+    } else if (!use_merged && functions) {
+        for (int i = 0; i < functions->capacity; i++) {
+            hash_entry_t* entry = functions->buckets[i];
+            while (entry) {
+                if (entry->value.addr && entry->value.self_time > 0) {
+                    uintptr_t a = (uintptr_t)entry->value.addr;
+                    int bin = (int)((a - low_pc) / actual_bin_bytes);
+                    if (bin < 0) bin = 0;
+                    if (bin >= num_bins) bin = num_bins - 1;
+                    long long samples = (long long)(entry->value.self_time / PROFILING_INTERVAL);
+                    if (samples > 65535) samples = 65535;
+                    hist[bin] = (uint16_t)(hist[bin] + samples > 65535 ? 65535 : hist[bin] + samples);
+                }
+                entry = entry->next;
+            }
+        }
+    }
+
+    // -------- Step 4: Write histogram record --------
+    uint8_t tag = GMON_TAG_TIME_HIST;
+    fwrite(&tag, 1, 1, fp);
+
+    // low_pc and high_pc (pointer-size, platform native)
+    fwrite(&low_pc, sizeof(uintptr_t), 1, fp);
+    fwrite(&high_pc, sizeof(uintptr_t), 1, fp);
+
+    // hist_size (bytes of histogram data)
+    fwrite(&hist_size, sizeof(uint32_t), 1, fp);
+
+    // prof_rate (samples per second)
+    fwrite(&PROF_RATE, sizeof(uint32_t), 1, fp);
+
+    // dimen: "seconds" padded to 15 bytes
+    char dimen[15] = "seconds        ";
+    fwrite(dimen, 15, 1, fp);
+
+    // dimen_abbrev: 's'
+    char abbrev = 's';
+    fwrite(&abbrev, 1, 1, fp);
+
+    // Histogram bin data
+    fwrite(hist, sizeof(uint16_t), num_bins, fp);
+    free(hist);
+
+    // -------- Step 5: Write call graph arc records --------
+    // helper lambda-style: write one arc
+    // For each caller -> callee pair with both valid addresses
+    tag = GMON_TAG_CG_ARC;
+
+    if (use_merged && thread_snapshot_count > 0) {
+        pthread_mutex_lock(&snapshot_mutex);
+        for (int t = 0; t < thread_snapshot_count; t++) {
+            caller_counts_hash_t* cc = thread_snapshots[t]->caller_counts;
+            hash_table_t* ht = thread_snapshots[t]->functions;
+            if (!cc || !ht) continue;
+
+            for (int i = 0; i < cc->capacity; i++) {
+                caller_map_entry_t* cme = cc->buckets[i];
+                while (cme) {
+                    function_info_t* caller_fi = hash_find(ht, cme->key);
+                    void* from_pc = caller_fi ? caller_fi->addr : NULL;
+
+                    if (from_pc && cme->callees) {
+                        for (int j = 0; j < cme->callees->capacity; j++) {
+                            caller_entry_t* ce = cme->callees->buckets[j];
+                            while (ce) {
+                                function_info_t* callee_fi = hash_find(ht, ce->key);
+                                void* self_pc = callee_fi ? callee_fi->addr : NULL;
+
+                                if (self_pc && ce->count > 0) {
+                                    fwrite(&tag, 1, 1, fp);
+                                    fwrite(&from_pc, sizeof(void*), 1, fp);
+                                    fwrite(&self_pc, sizeof(void*), 1, fp);
+                                    uint32_t cnt = (ce->count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)ce->count;
+                                    fwrite(&cnt, sizeof(uint32_t), 1, fp);
+                                }
+                                ce = ce->next;
+                            }
+                        }
+                    }
+                    cme = cme->next;
+                }
+            }
+        }
+        pthread_mutex_unlock(&snapshot_mutex);
+    } else if (!use_merged && caller_counts && functions) {
+        for (int i = 0; i < caller_counts->capacity; i++) {
+            caller_map_entry_t* cme = caller_counts->buckets[i];
+            while (cme) {
+                function_info_t* caller_fi = hash_find(functions, cme->key);
+                void* from_pc = caller_fi ? caller_fi->addr : NULL;
+
+                if (from_pc && cme->callees) {
+                    for (int j = 0; j < cme->callees->capacity; j++) {
+                        caller_entry_t* ce = cme->callees->buckets[j];
+                        while (ce) {
+                            function_info_t* callee_fi = hash_find(functions, ce->key);
+                            void* self_pc = callee_fi ? callee_fi->addr : NULL;
+
+                            if (self_pc && ce->count > 0) {
+                                fwrite(&tag, 1, 1, fp);
+                                fwrite(&from_pc, sizeof(void*), 1, fp);
+                                fwrite(&self_pc, sizeof(void*), 1, fp);
+                                uint32_t cnt = (ce->count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)ce->count;
+                                fwrite(&cnt, sizeof(uint32_t), 1, fp);
+                            }
+                            ce = ce->next;
+                        }
+                    }
+                }
+                cme = cme->next;
+            }
+        }
+    }
+
+    fclose(fp);
+    printf("gmon.out exported to %s\n", filename);
+    printf("Analyze with: gprof ./main %s\n", filename);
+}
+
+// ============================================================
 // Phase 5: Memory Cleanup Functions
 // ============================================================
 
@@ -1507,7 +1775,8 @@ int main(int argc, char* argv[]) {
     // Phase 4/8: Parse command line arguments
     int multi_threaded = 0;
     int shared_test = 0;
-    int export_dot = 0;  // Phase 8: Export call graph to DOT format
+    int export_dot = 0;   // Phase 8: Export call graph to DOT format
+    int export_gmon = 0;  // Phase 6: Export gmon.out binary file
     char report_mode[32] = "per-thread";  // default: per-thread, options: merged, both
     char dot_mode[32] = "merged";  // Phase 8: per-thread or merged
 
@@ -1523,6 +1792,8 @@ int main(int argc, char* argv[]) {
             export_dot = 1;  // Phase 8: Enable DOT export
         } else if (strncmp(argv[i], "--dot-mode=", 11) == 0) {
             strncpy(dot_mode, argv[i] + 11, 31);  // Phase 8: per-thread or merged
+        } else if (strcmp(argv[i], "--export-gmon") == 0) {
+            export_gmon = 1;  // Phase 6: Enable gmon.out export
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("\nUsage: %s [options]\n", argv[0]);
             printf("Options:\n");
@@ -1531,6 +1802,7 @@ int main(int argc, char* argv[]) {
             printf("  --report-mode=MODE       Report mode: per-thread, merged, or both (default: per-thread)\n");
             printf("  --export-dot             Export call graph to Graphviz DOT format (Phase 8)\n");
             printf("  --dot-mode=MODE          DOT export mode: per-thread or merged (default: merged)\n");
+            printf("  --export-gmon            Export gmon.out binary file for gprof analysis (Phase 6)\n");
             printf("  --help                   Show this help message\n\n");
             printf("Examples:\n");
             printf("  %s                                    # Single-threaded test\n", argv[0]);
@@ -1596,7 +1868,26 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Phase 6: Export gmon.out (merged mode for multi-threaded)
+        if (export_gmon) {
+            printf("\n");
+            printf("================================================================================\n");
+            printf("Exporting gmon.out (Phase 6) - merged mode\n");
+            printf("================================================================================\n");
+            export_gmon_out("gmon.out", 1);
+        }
+
         cleanup_thread_snapshots();
+    } else {
+        // Single-threaded: report already printed inside run_single_threaded_tests()
+        // Phase 6: Export gmon.out using current thread's TLS data
+        if (export_gmon) {
+            printf("\n");
+            printf("================================================================================\n");
+            printf("Exporting gmon.out (Phase 6) - single-threaded mode\n");
+            printf("================================================================================\n");
+            export_gmon_out("gmon.out", 0);
+        }
     }
 
     printf("\nProfiling stopped.\n");
