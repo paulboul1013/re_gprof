@@ -15,7 +15,7 @@
 #include <stdint.h>       // Phase 6: uintptr_t
 #include <elf.h>          // Phase 7: ELF format structures
 #include <sys/mman.h>     // Phase 7: mmap for reading ELF file
-#include <sys/stat.h>     // Phase 7: stat for file size
+#include <sys/stat.h>     // Phase 7: fstat for file size
 
 // Phase 6: gmon.out format constants
 #define GMON_MAGIC      "gmon"
@@ -27,7 +27,7 @@
 // Phase 7: ELF Symbol Resolution
 // ============================================================
 
-// One entry in our symbol table: address + name
+// One entry in our symbol table: start address, byte size, and name
 typedef struct {
     uintptr_t addr;
     uintptr_t size;
@@ -41,11 +41,146 @@ typedef struct {
     int capacity;
 } elf_sym_table_t;
 
+static elf_sym_table_t* elf_sym_table_create(void) {
+    elf_sym_table_t* t = (elf_sym_table_t*)malloc(sizeof(elf_sym_table_t));
+    if (!t) return NULL;
+    t->capacity = 256;
+    t->count = 0;
+    t->entries = (elf_sym_t*)malloc(t->capacity * sizeof(elf_sym_t));
+    if (!t->entries) { free(t); return NULL; }
+    return t;
+}
+
+static void elf_sym_table_add(elf_sym_table_t* t, uintptr_t addr, uintptr_t size, const char* name) {
+    if (!t || !t->entries) return;
+    if (t->count >= t->capacity) {
+        t->capacity *= 2;
+        elf_sym_t* new_entries = (elf_sym_t*)realloc(t->entries, t->capacity * sizeof(elf_sym_t));
+        if (!new_entries) return;
+        t->entries = new_entries;
+    }
+    t->entries[t->count].addr = addr;
+    t->entries[t->count].size = size;
+    strncpy(t->entries[t->count].name, name, 255);
+    t->entries[t->count].name[255] = '\0';
+    t->count++;
+}
+
+static int elf_sym_cmp(const void* a, const void* b) {
+    const elf_sym_t* sa = (const elf_sym_t*)a;
+    const elf_sym_t* sb = (const elf_sym_t*)b;
+    if (sa->addr < sb->addr) return -1;
+    if (sa->addr > sb->addr) return 1;
+    return 0;
+}
+
+void elf_free_sym_table(elf_sym_table_t* t) {
+    if (!t) return;
+    free(t->entries);
+    free(t);
+}
+
+// Phase 7: Load function symbols from ELF binary (.symtab section).
+// Uses mmap to read the file, finds .symtab + linked .strtab,
+// and returns a sorted elf_sym_table_t* (or NULL on failure).
+elf_sym_table_t* elf_load_symbols(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("elf_load_symbols: open");
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return NULL;
+    }
+
+    size_t file_size = (size_t)st.st_size;
+    void* base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) {
+        perror("elf_load_symbols: mmap");
+        return NULL;
+    }
+
+    // Validate ELF magic
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)base;
+    if (ehdr->e_ident[0] != ELFMAG0 || ehdr->e_ident[1] != ELFMAG1 ||
+        ehdr->e_ident[2] != ELFMAG2 || ehdr->e_ident[3] != ELFMAG3) {
+        fprintf(stderr, "elf_load_symbols: not an ELF file: %s\n", path);
+        munmap(base, file_size);
+        return NULL;
+    }
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "elf_load_symbols: only 64-bit ELF supported\n");
+        munmap(base, file_size);
+        return NULL;
+    }
+
+    // Get section header table
+    Elf64_Shdr* shdrs = (Elf64_Shdr*)((char*)base + ehdr->e_shoff);
+
+    // Get .shstrtab (section name string table)
+    if (ehdr->e_shstrndx == SHN_UNDEF) {
+        fprintf(stderr, "elf_load_symbols: no section name table\n");
+        munmap(base, file_size);
+        return NULL;
+    }
+    Elf64_Shdr* shstrtab_hdr = &shdrs[ehdr->e_shstrndx];
+    const char* shstrtab = (const char*)base + shstrtab_hdr->sh_offset;
+
+    // Find .symtab and its associated .strtab (via sh_link)
+    Elf64_Shdr* symtab_hdr = NULL;
+    Elf64_Shdr* strtab_hdr = NULL;
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        const char* sec_name = shstrtab + shdrs[i].sh_name;
+        if (shdrs[i].sh_type == SHT_SYMTAB && strcmp(sec_name, ".symtab") == 0) {
+            symtab_hdr = &shdrs[i];
+            if (shdrs[i].sh_link < (unsigned)ehdr->e_shnum) {
+                strtab_hdr = &shdrs[shdrs[i].sh_link];
+            }
+        }
+    }
+
+    if (!symtab_hdr || !strtab_hdr) {
+        fprintf(stderr, "elf_load_symbols: no .symtab found in %s (stripped?)\n", path);
+        munmap(base, file_size);
+        return NULL;
+    }
+
+    // Read function symbols
+    Elf64_Sym* syms = (Elf64_Sym*)((char*)base + symtab_hdr->sh_offset);
+    int num_syms = (int)(symtab_hdr->sh_size / sizeof(Elf64_Sym));
+    const char* strtab = (const char*)base + strtab_hdr->sh_offset;
+
+    elf_sym_table_t* table = elf_sym_table_create();
+    if (!table) {
+        munmap(base, file_size);
+        return NULL;
+    }
+
+    for (int i = 0; i < num_syms; i++) {
+        if (ELF64_ST_TYPE(syms[i].st_info) == STT_FUNC && syms[i].st_value != 0) {
+            const char* sym_name = strtab + syms[i].st_name;
+            elf_sym_table_add(table, (uintptr_t)syms[i].st_value,
+                              (uintptr_t)syms[i].st_size, sym_name);
+        }
+    }
+
+    munmap(base, file_size);
+
+    // Sort by address for binary search
+    qsort(table->entries, table->count, sizeof(elf_sym_t), elf_sym_cmp);
+
+    printf("[ELF] Loaded %d function symbols from %s\n", table->count, path);
+    return table;
+}
 
 #define MAX_FUNCTIONS 1000
 #define MAX_CALL_STACK 100
 #define PROFILING_INTERVAL 10000 //sample interval 10ms
-
 
 typedef unsigned long long time_stamp;
 
