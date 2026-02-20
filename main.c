@@ -209,6 +209,46 @@ static const elf_sym_t* elf_resolve_addr(const elf_sym_table_t* table, uintptr_t
     return best;
 }
 
+// Phase 7: Load symbols from System.map format file.
+// Format: "<hex_addr> <type> <name>" one per line.
+// Only loads type 'T' or 't' (text/code section symbols).
+// Returns a sorted elf_sym_table_t*, or NULL on failure.
+static elf_sym_table_t* sysmap_load_symbols(const char* path) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        perror("sysmap_load_symbols: fopen");
+        return NULL;
+    }
+
+    elf_sym_table_t* table = elf_sym_table_create();
+    if (!table) { fclose(fp); return NULL; }
+
+    char line[512];
+    int loaded = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char addr_str[32], type_str[4], name[256];
+        if (sscanf(line, "%31s %3s %255s", addr_str, type_str, name) != 3) continue;
+
+        // Only text (code) symbols: T (global) or t (local)
+        if (type_str[0] != 'T' && type_str[0] != 't') continue;
+
+        uintptr_t addr = (uintptr_t)strtoull(addr_str, NULL, 16);
+        if (addr == 0) continue;
+
+        elf_sym_table_add(table, addr, 0, name);
+        loaded++;
+    }
+    fclose(fp);
+
+    // Sort by address for binary search
+    if (table->count > 0) {
+        qsort(table->entries, table->count, sizeof(elf_sym_t), elf_sym_cmp);
+    }
+
+    printf("[ELF] Loaded %d symbols from System.map: %s\n", loaded, path);
+    return table;
+}
+
 #define MAX_FUNCTIONS 1000
 #define MAX_CALL_STACK 100
 #define PROFILING_INTERVAL 10000 //sample interval 10ms
