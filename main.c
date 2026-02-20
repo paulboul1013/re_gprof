@@ -51,12 +51,12 @@ static elf_sym_table_t* elf_sym_table_create(void) {
     return t;
 }
 
-static void elf_sym_table_add(elf_sym_table_t* t, uintptr_t addr, uintptr_t size, const char* name) {
-    if (!t || !t->entries) return;
+static int elf_sym_table_add(elf_sym_table_t* t, uintptr_t addr, uintptr_t size, const char* name) {
+    if (!t || !t->entries) return -1;
     if (t->count >= t->capacity) {
         int new_cap = t->capacity * 2;
         elf_sym_t* new_entries = (elf_sym_t*)realloc(t->entries, new_cap * sizeof(elf_sym_t));
-        if (!new_entries) return;  // t->capacity unchanged, t->entries unchanged
+        if (!new_entries) return -1;  // t->capacity unchanged, t->entries unchanged
         t->entries = new_entries;
         t->capacity = new_cap;
     }
@@ -65,6 +65,7 @@ static void elf_sym_table_add(elf_sym_table_t* t, uintptr_t addr, uintptr_t size
     strncpy(t->entries[t->count].name, name, 255);
     t->entries[t->count].name[255] = '\0';
     t->count++;
+    return 0;
 }
 
 static int elf_sym_cmp(const void* a, const void* b) {
@@ -232,11 +233,13 @@ static elf_sym_table_t* sysmap_load_symbols(const char* path) {
         // Only text (code) symbols: T (global) or t (local)
         if (type_str[0] != 'T' && type_str[0] != 't') continue;
 
-        uintptr_t addr = (uintptr_t)strtoull(addr_str, NULL, 16);
-        if (addr == 0) continue;
+        char* endptr = NULL;
+        uintptr_t addr = (uintptr_t)strtoull(addr_str, &endptr, 16);
+        if (endptr == addr_str || addr == 0) continue;  // parse error or zero address
 
-        elf_sym_table_add(table, addr, 0, name);
-        loaded++;
+        if (elf_sym_table_add(table, addr, 0, name) == 0) {
+            loaded++;
+        }
     }
     fclose(fp);
 
