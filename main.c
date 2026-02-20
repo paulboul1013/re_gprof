@@ -54,10 +54,11 @@ static elf_sym_table_t* elf_sym_table_create(void) {
 static void elf_sym_table_add(elf_sym_table_t* t, uintptr_t addr, uintptr_t size, const char* name) {
     if (!t || !t->entries) return;
     if (t->count >= t->capacity) {
-        t->capacity *= 2;
-        elf_sym_t* new_entries = (elf_sym_t*)realloc(t->entries, t->capacity * sizeof(elf_sym_t));
-        if (!new_entries) return;
+        int new_cap = t->capacity * 2;
+        elf_sym_t* new_entries = (elf_sym_t*)realloc(t->entries, new_cap * sizeof(elf_sym_t));
+        if (!new_entries) return;  // t->capacity unchanged, t->entries unchanged
         t->entries = new_entries;
+        t->capacity = new_cap;
     }
     t->entries[t->count].addr = addr;
     t->entries[t->count].size = size;
@@ -74,7 +75,7 @@ static int elf_sym_cmp(const void* a, const void* b) {
     return 0;
 }
 
-void elf_free_sym_table(elf_sym_table_t* t) {
+static void elf_free_sym_table(elf_sym_table_t* t) {
     if (!t) return;
     free(t->entries);
     free(t);
@@ -83,7 +84,7 @@ void elf_free_sym_table(elf_sym_table_t* t) {
 // Phase 7: Load function symbols from ELF binary (.symtab section).
 // Uses mmap to read the file, finds .symtab + linked .strtab,
 // and returns a sorted elf_sym_table_t* (or NULL on failure).
-elf_sym_table_t* elf_load_symbols(const char* path) {
+static elf_sym_table_t* elf_load_symbols(const char* path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("elf_load_symbols: open");
@@ -122,8 +123,8 @@ elf_sym_table_t* elf_load_symbols(const char* path) {
     Elf64_Shdr* shdrs = (Elf64_Shdr*)((char*)base + ehdr->e_shoff);
 
     // Get .shstrtab (section name string table)
-    if (ehdr->e_shstrndx == SHN_UNDEF) {
-        fprintf(stderr, "elf_load_symbols: no section name table\n");
+    if (ehdr->e_shstrndx == SHN_UNDEF || ehdr->e_shstrndx >= ehdr->e_shnum) {
+        fprintf(stderr, "elf_load_symbols: invalid section name table index\n");
         munmap(base, file_size);
         return NULL;
     }
