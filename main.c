@@ -13,12 +13,33 @@
 #include <sys/syscall.h>  // For syscall(SYS_gettid)
 #include <dlfcn.h>        // Phase 6: dladdr() for function address lookup
 #include <stdint.h>       // Phase 6: uintptr_t
+#include <elf.h>          // Phase 7: ELF format structures
+#include <sys/mman.h>     // Phase 7: mmap for reading ELF file
+#include <sys/stat.h>     // Phase 7: stat for file size
 
 // Phase 6: gmon.out format constants
 #define GMON_MAGIC      "gmon"
 #define GMON_VERSION    1
 #define GMON_TAG_TIME_HIST  0
 #define GMON_TAG_CG_ARC     1
+
+// ============================================================
+// Phase 7: ELF Symbol Resolution
+// ============================================================
+
+// One entry in our symbol table: address + name
+typedef struct {
+    uintptr_t addr;
+    uintptr_t size;
+    char name[256];
+} elf_sym_t;
+
+// Sorted array of function symbols loaded from ELF or System.map
+typedef struct {
+    elf_sym_t* entries;
+    int count;
+    int capacity;
+} elf_sym_table_t;
 
 
 #define MAX_FUNCTIONS 1000
