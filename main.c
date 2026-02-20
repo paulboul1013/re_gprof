@@ -2198,9 +2198,34 @@ int main(int argc, char* argv[]) {
             export_gmon_out("gmon.out", 1);
         }
 
-        // Phase 7: ELF symbol resolution report
+        // Phase 7: ELF symbol resolution report (multi-threaded: use merged hash table)
         if (g_sym_table) {
-            print_elf_symbol_report(g_sym_table, functions);
+            // Build a temporary merged hash table from all thread snapshots for ELF addr lookup
+            hash_table_t* merged_ht = create_hash_table(512);
+            if (merged_ht) {
+                pthread_mutex_lock(&snapshot_mutex);
+                for (int _t = 0; _t < thread_snapshot_count; _t++) {
+                    hash_table_t* ht = thread_snapshots[_t]->functions;
+                    if (!ht) continue;
+                    for (int _i = 0; _i < ht->capacity; _i++) {
+                        hash_entry_t* _e = ht->buckets[_i];
+                        while (_e) {
+                            function_info_t* dst = hash_insert(merged_ht, _e->key);
+                            if (dst && dst->call_count == 0) {
+                                // Copy addr and name; we only need these for ELF lookup
+                                dst->addr = _e->value.addr;
+                                strncpy(dst->name, _e->value.name, 255);
+                                dst->name[255] = '\0';
+                                dst->call_count = 1; // mark as populated
+                            }
+                            _e = _e->next;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&snapshot_mutex);
+                print_elf_symbol_report(g_sym_table, merged_ht);
+                free_hash_table(merged_ht);
+            }
             elf_free_sym_table(g_sym_table);
             g_sym_table = NULL;
         }
