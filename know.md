@@ -3228,6 +3228,558 @@ gdb ./main
 
 Phase 5 不僅是功能升級，更是深入學習系統程式設計的絕佳機會！
 
+---
+
+## Phase 6: gmon.out 格式輸出 (已完成)
+
+**完成日期**: 2026-02-19
+
+### 1. gmon.out 是什麼？
+
+`gmon.out` 是 GNU profiler (`gprof`) 的輸出格式，由程式執行後自動產生（需以 `-pg` 旗標編譯）。`gprof` 工具讀取此二進位檔案，結合可執行檔的符號表，輸出 flat profile 和 call graph。
+
+```
+程式執行 → gmon.out（二進位）→ gprof ./program gmon.out → 人類可讀報表
+```
+
+本專案實作了 `export_gmon_out()` 函數，在不依賴 `-pg` 編譯旗標的情況下，從 instrumentation 資料產生相容格式的 `gmon.out`。
+
+---
+
+### 2. gmon.out 檔案格式結構
+
+gmon.out 使用固定 header + 可變長度 tagged records 的格式：
+
+#### 2.1 Header（固定 20 bytes）
+
+```
+偏移  大小    內容
+0     4       magic: "gmon"（4 個 ASCII 字元，非 null-terminated）
+4     4       version: uint32_t = 1
+8     12      spare: 全 0 填充
+```
+
+```c
+// C 語言寫入方式
+fwrite("gmon", 4, 1, fp);          // magic
+uint32_t version = 1;
+fwrite(&version, 4, 1, fp);        // version
+char spare[12] = {0};
+fwrite(spare, 12, 1, fp);          // spare
+```
+
+#### 2.2 Tagged Records（可變數量）
+
+每筆 record 以 1 byte tag 開頭，決定後續格式：
+
+| Tag | 值   | 說明 |
+|-----|------|------|
+| `GMON_TAG_TIME_HIST` | 0x00 | 時間直方圖（PC sampling 資料）|
+| `GMON_TAG_CG_ARC`   | 0x01 | Call graph arc（呼叫關係）|
+
+---
+
+### 3. Time Histogram Record（Tag 0x00）
+
+Histogram 記錄 PC sampling 的分佈，即程式執行時「哪些位址被採樣到最多次」。
+
+#### 3.1 Record 結構
+
+```
+偏移  大小           內容
+0     1              tag = 0x00
+1     sizeof(void*)  low_pc：最低函數位址
++     sizeof(void*)  high_pc：最高函數位址（含 padding）
++     4              hist_size：bin 的數量（uint32_t）
++     4              prof_rate：採樣頻率 Hz（uint32_t，例如 100）
++     15             dimen：時間單位字串，例如 "seconds        "
++     1              dimen_abbrev：縮寫字元，例如 's'
++     hist_size*2    histogram bins：uint16_t 陣列
+```
+
+#### 3.2 Bin 計算邏輯
+
+```c
+uintptr_t addr_range = high_pc - low_pc;
+int num_bins = addr_range / 2;              // 每 2 bytes 一個 bin
+if (num_bins > 65536) num_bins = 65536;    // 上限
+
+double actual_bin_bytes = (double)addr_range / num_bins;
+
+// 將函數的 self_time 換算成採樣次數，填入對應 bin
+int bin = (int)((func_addr - low_pc) / actual_bin_bytes);
+long long samples = func.self_time / PROFILING_INTERVAL;  // us / us = 次數
+hist[bin] += (uint16_t)samples;
+```
+
+**重點**：`hist_size` 是 bin 的「個數」，不是 byte 數。每個 bin 是 `uint16_t`（2 bytes），所以資料大小 = `hist_size * 2` bytes。
+
+#### 3.3 設計考量
+
+- **傳統 gprof**：用 `SIGPROF` 在實際 PC 位址採樣，精確反映 CPU 使用分佈
+- **本專案**：用 instrumentation 的 `self_time` 換算成「等效採樣次數」，是近似值
+- `high_pc` 需加 `0x1000` padding，避免最後一個函數超出範圍
+
+---
+
+### 4. Call Graph Arc Record（Tag 0x01）
+
+Arc records 記錄函數間的呼叫關係，每筆代表一對 caller→callee。
+
+#### 4.1 Record 結構
+
+```
+偏移  大小           內容
+0     1              tag = 0x01
+1     sizeof(void*)  from_pc：caller 的函數位址
++     sizeof(void*)  self_pc：callee 的函數位址
++     4              count：呼叫次數（uint32_t）
+```
+
+```c
+// C 語言寫入方式
+uint8_t tag = 0x01;
+fwrite(&tag, 1, 1, fp);
+fwrite(&from_pc, sizeof(void*), 1, fp);   // caller 位址
+fwrite(&self_pc, sizeof(void*), 1, fp);   // callee 位址
+uint32_t cnt = (uint32_t)call_count;
+fwrite(&cnt, 4, 1, fp);
+```
+
+#### 4.2 位址來源
+
+本專案在 `function_info_t` 中儲存函數位址：
+
+```c
+typedef struct {
+    char name[256];
+    void* addr;        // 函數起始位址（用函數指標強轉 void*）
+    long long self_time;
+    // ...
+} function_info_t;
+```
+
+透過 hash table 查找 caller/callee 的 `addr`，取得寫入 arc record 的位址。
+
+---
+
+### 5. Binary File I/O in C
+
+#### 5.1 以二進位模式開檔
+
+```c
+FILE* fp = fopen("gmon.out", "wb");   // "wb" = write binary
+if (!fp) {
+    perror("fopen");
+    return;
+}
+```
+
+- `"w"` vs `"wb"`：在 Windows 上 `"w"` 會將 `\n` 轉為 `\r\n`，二進位格式必須用 `"wb"`
+- Linux 上兩者無差異，但保持 `"wb"` 是良好習慣
+
+#### 5.2 fwrite 函數
+
+```c
+size_t fwrite(const void *ptr, size_t size, size_t count, FILE *stream);
+// ptr:    資料指標
+// size:   每個元素的大小（bytes）
+// count:  元素數量
+// 回傳:   實際寫入的元素數量
+```
+
+常見用法：
+```c
+fwrite("gmon", 4, 1, fp);              // 寫 4 bytes 字串
+fwrite(&version, sizeof(uint32_t), 1, fp);  // 寫一個 uint32
+fwrite(hist, sizeof(uint16_t), num_bins, fp);  // 寫 uint16_t 陣列
+```
+
+#### 5.3 Endianness（位元組序）
+
+gmon.out 使用 native endianness（與建置平台一致）：
+- x86/x86_64：Little-endian（低位元組存低位址）
+- ARM big-endian：則為 big-endian
+
+**本專案**直接用 `fwrite(&value, sizeof, 1, fp)` 寫入，保持 native order，與同平台的 `gprof` 相容。若需要跨平台，需加 `htole32()` 等轉換。
+
+---
+
+### 6. Instrumentation vs Sampling：產生 gmon.out 的差異
+
+| 特性 | 傳統 gprof (`-pg`) | 本專案 (instrumentation) |
+|------|-------------------|--------------------------|
+| Histogram 來源 | 真實 SIGPROF 在 PC 採樣 | self_time 換算 |
+| Arc count 來源 | `_mcount()` 插樁自動累加 | 手動 `caller_counts` 矩陣 |
+| 函數位址 | 直接取 PC 值 | 記錄 `function_info_t.addr` |
+| 精確性 | 高（直接採樣） | 中（近似，但 total time 精確）|
+| 相容性 | 完全相容 gprof | 部分相容（histogram 為近似）|
+
+**關鍵限制**：傳統 `gprof` 使用 `-pg` 在每個函數入口插入 `_mcount()` call，並搭配 `SIGPROF` 在程式 `.text` 段採樣。本專案的 histogram 是從 `self_time` 反推，精確度取決於 SIGPROF 採樣密度。
+
+---
+
+### 7. 實作的 `export_gmon_out()` 流程
+
+```
+1. 開啟 gmon.out (wb)
+2. 寫入 header (20 bytes)
+3. 掃描所有函數，找出 low_pc / high_pc
+4. 分配 histogram 陣列（uint16_t hist[num_bins]）
+5. 遍歷函數，將 self_time 換算成 samples，填入對應 bin
+6. 寫入 TAG_TIME_HIST record（header + bin data）
+7. 遍歷 caller_counts hash table，寫入 TAG_CG_ARC records
+8. 關閉檔案
+```
+
+支援兩種模式：
+- `use_merged = 1`：從 `thread_snapshots[]` 收集多執行緒資料（merged）
+- `use_merged = 0`：從當前 TLS 的 `functions` 收集單執行緒資料
+
+---
+
+### 8. 重要數字與常數
+
+```c
+#define GMON_MAGIC      "gmon"      // 4 bytes，非 null terminated
+#define GMON_VERSION    1
+#define GMON_TAG_TIME_HIST  0       // histogram tag
+#define GMON_TAG_CG_ARC     1       // call arc tag
+
+const int BIN_BYTES = 2;           // 每個 histogram bin 代表 2 bytes 位址空間
+const uint32_t PROF_RATE = 100;    // 100 Hz = 10ms 採樣間隔
+int max_bins = 65536;              // histogram 上限（避免過大）
+```
+
+---
+
+### 9. 驗證方式
+
+```bash
+# 產生 gmon.out
+./main --export-gmon
+
+# 查看檔案大小和 hex dump 前幾 bytes
+ls -la gmon.out
+xxd gmon.out | head -5
+
+# 預期 header（前 20 bytes）
+# 6d 6f 6e 67  = "gmon"（little-endian 顯示實際是 "gmon"）
+# 01 00 00 00  = version 1
+# 00 00 00 00 00 00 00 00 00 00 00 00 = spare
+
+# 嘗試用 gprof 解析（結果有限，因 histogram 為近似）
+gprof ./main gmon.out
+```
+
+---
+
+### 10. 本階段學到的核心觀念
+
+1. **gmon.out 格式** = Header (20B) + Tagged Records（TAG_TIME_HIST + TAG_CG_ARC）
+2. **Binary I/O** 必須用 `"wb"` 模式，用 `fwrite()` 直接寫記憶體內容
+3. **Histogram** 是將 PC 位址空間分成等寬 bins，每個 bin 記錄採樣次數
+4. **Arc records** 每筆固定大小：1(tag) + ptr + ptr + 4(count)
+5. **Instrumentation vs Sampling**：兩種方法都能產生 gmon.out，但精確度不同
+6. **函數位址** 透過函數指標強轉 `void*` 取得，用於 histogram bin 計算和 arc records
+
+---
+
+## Phase 7: ELF 符號解析 (已完成)
+
+**完成日期**: 2026-02-20
+
+### 1. 為什麼需要 ELF 符號解析？
+
+傳統 gprof 在 stripped binary 上只能顯示位址，無法顯示函數名稱。ELF 符號解析讓我們能：
+- 直接從 `.symtab` 讀取所有函數名稱（包含 `static` 函數）
+- 驗證 instrumentation 捕獲的位址是否與 ELF 符號一致
+- 在 stripped binary 下使用外部 System.map 作為備援
+
+```
+profiler addr (from dladdr) → elf_resolve_addr() → ELF symbol name
+```
+
+本工具已透過 instrumentation 取得函數名（`__func__`），因此 ELF 解析的主要用途是**驗證位址正確性**和**教學目的**。
+
+---
+
+### 2. ELF 檔案格式詳解
+
+#### 2.1 ELF Header (`Elf64_Ehdr`)
+
+```c
+typedef struct {
+    unsigned char e_ident[16];  // Magic + class + endianness + ...
+    Elf64_Half    e_type;        // ET_EXEC = executable
+    Elf64_Half    e_machine;     // EM_X86_64
+    Elf64_Word    e_version;
+    Elf64_Addr    e_entry;       // Entry point address
+    Elf64_Off     e_phoff;       // Program header table offset
+    Elf64_Off     e_shoff;       // Section header table offset  ← 重要
+    Elf64_Word    e_flags;
+    Elf64_Half    e_ehsize;      // ELF header size (64 bytes)
+    Elf64_Half    e_phentsize;
+    Elf64_Half    e_phnum;
+    Elf64_Half    e_shentsize;   // Section header entry size
+    Elf64_Half    e_shnum;       // Number of sections           ← 重要
+    Elf64_Half    e_shstrndx;    // Index of .shstrtab section   ← 重要
+} Elf64_Ehdr;
+```
+
+**關鍵欄位**：
+- `e_shoff`：section header table 在檔案中的偏移
+- `e_shnum`：section 數量
+- `e_shstrndx`：.shstrtab（section 名稱字串表）的 section index
+
+#### 2.2 Section Header (`Elf64_Shdr`)
+
+```c
+typedef struct {
+    Elf64_Word  sh_name;    // 在 .shstrtab 中的字串偏移
+    Elf64_Word  sh_type;    // SHT_SYMTAB / SHT_STRTAB / SHT_DYNSYM ...
+    Elf64_Xword sh_flags;
+    Elf64_Addr  sh_addr;    // 執行期虛擬位址（若 SHF_ALLOC）
+    Elf64_Off   sh_offset;  // 在檔案中的偏移  ← 重要
+    Elf64_Xword sh_size;    // section 大小
+    Elf64_Word  sh_link;    // 關聯的 section index（.symtab → .strtab）← 重要
+    Elf64_Word  sh_info;
+    Elf64_Xword sh_addralign;
+    Elf64_Xword sh_entsize; // 每個 entry 大小（.symtab entry = sizeof(Elf64_Sym)）
+} Elf64_Shdr;
+```
+
+**重要的 `sh_type` 值**：
+
+| 值 | 名稱 | 說明 |
+|----|------|------|
+| 2 | `SHT_SYMTAB` | 靜態符號表（strip 後消失）|
+| 3 | `SHT_STRTAB` | 字串表 |
+| 11 | `SHT_DYNSYM` | 動態符號表（strip 後保留）|
+
+**`sh_link`**：`.symtab` 的 `sh_link` 欄位指向其關聯的 `.strtab` section index，比名稱查找更可靠。
+
+#### 2.3 Symbol Table Entry (`Elf64_Sym`)
+
+```c
+typedef struct {
+    Elf64_Word  st_name;   // 在 .strtab 中的字串偏移
+    unsigned char st_info; // 高 4 bit = binding, 低 4 bit = type
+    unsigned char st_other;
+    Elf64_Section st_shndx; // 所在 section index
+    Elf64_Addr  st_value;   // 符號位址（函數起始位址）← 重要
+    Elf64_Xword st_size;    // 符號大小（函數 byte 數）
+} Elf64_Sym;
+```
+
+**`st_info` 解碼**：
+```c
+// 取得符號 binding（STB_LOCAL/STB_GLOBAL/STB_WEAK）
+ELF64_ST_BIND(st_info)
+
+// 取得符號 type（STT_FUNC/STT_OBJECT/STT_NOTYPE 等）
+ELF64_ST_TYPE(st_info)
+
+// 組合
+ELF64_ST_INFO(bind, type)
+```
+
+**函數符號過濾**：
+```c
+if (ELF64_ST_TYPE(syms[i].st_info) == STT_FUNC && syms[i].st_value != 0) {
+    // 這是一個有效的函數符號
+}
+```
+
+---
+
+### 3. `.symtab` vs `.dynsym`
+
+| 特性 | `.symtab` | `.dynsym` |
+|------|-----------|-----------|
+| 包含 | 所有符號（static + extern）| 只有動態連結需要的符號 |
+| `strip` 後 | 被刪除 | 保留（必須，動態連結器需要）|
+| `nm` 指令 | 讀取此表 | `-D` 旗標時讀取 |
+| 用途 | debug、gprof | 動態連結 |
+
+```bash
+nm main          # 讀取 .symtab（有符號時）
+nm -D main       # 讀取 .dynsym（動態符號）
+nm main_stripped # 輸出 "no symbols"（.symtab 已被 strip 刪除）
+nm -D main_stripped  # 仍有輸出（.dynsym 保留）
+```
+
+---
+
+### 4. 使用 mmap() 讀取大型二進位檔案
+
+`mmap()` 將檔案映射到記憶體，比 `read()` + buffer 更高效（零拷貝）：
+
+```c
+// 開啟並取得檔案大小
+int fd = open(path, O_RDONLY);
+struct stat st;
+fstat(fd, &st);
+size_t file_size = st.st_size;
+
+// 映射整個檔案
+void* base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+close(fd);  // fd 可立即關閉，映射不受影響
+
+// 使用映射記憶體
+Elf64_Ehdr* ehdr = (Elf64_Ehdr*)base;
+
+// 釋放映射
+munmap(base, file_size);
+```
+
+**注意**：`mmap()` 後的指標（如 `sym_name = strtab + sym->st_name`）在 `munmap()` 後失效。必須在 munmap 前用 `strncpy()` 複製字串。
+
+---
+
+### 5. 二分搜尋：找最近左邊界
+
+`elf_resolve_addr()` 的目標是找「最後一個 addr ≤ query」的符號（函數起始位址 ≤ 查詢位址）：
+
+```c
+const elf_sym_t* elf_resolve_addr(const elf_sym_table_t* table, uintptr_t query_addr) {
+    int lo = 0, hi = table->count - 1;
+    const elf_sym_t* best = NULL;
+
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (table->entries[mid].addr <= query_addr) {
+            best = &table->entries[mid];  // 候選，繼續往右找更大的
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // best = 最後一個 addr <= query 的符號
+    // ...（可選：驗證 query < addr + size）
+}
+```
+
+**前提**：`table->entries` 必須以 `addr` 升序排列（用 `qsort()` + 比較函數）。
+
+---
+
+### 6. System.map 格式
+
+System.map 是 Linux kernel 在 build 時產生的符號表文字檔，每行格式：
+
+```
+<hex_addr> <type> <name>
+```
+
+常見 type：
+- `T` / `t`：text section（程式碼），大寫 = global，小寫 = local
+- `D` / `d`：data section（資料）
+- `R` / `r`：read-only data
+- `U`：undefined（外部符號）
+
+從 ELF binary 產生 System.map 格式：
+```bash
+nm main | awk '$2 ~ /^[TtFf]$/ {print $1, $2, $3}'
+```
+
+**應用場景**：
+- Stripped kernel module 的符號解析
+- 跨機器 profiling（在 build 機器產生 map，在目標機器解析）
+- 作為 ELF 解析的備援機制
+
+---
+
+### 7. `strip` 指令的影響
+
+```bash
+strip main          # 移除 .symtab, .strtab, .debug_* 等 sections
+strip --strip-debug main  # 只移除 debug info，保留 .symtab
+```
+
+**strip 前後的 section 比較**：
+```bash
+readelf -S main | grep -E "symtab|strtab|debug"
+# 有 .symtab, .strtab, .debug_info 等
+
+readelf -S main_stripped | grep -E "symtab|strtab|debug"
+# 只剩 .dynstr, .dynsym（動態連結必要）
+```
+
+**本工具的處理**：
+- 有 .symtab → `elf_load_symbols()` 成功
+- 無 .symtab → 顯示錯誤並回傳 NULL
+- 搭配 `--sysmap` → `sysmap_load_symbols()` 讀取外部文字檔
+
+---
+
+### 8. 本工具新增的 API
+
+```c
+// 從 ELF binary 載入函數符號（.symtab）
+static elf_sym_table_t* elf_load_symbols(const char* path);
+
+// 從 System.map 格式文字檔載入符號
+static elf_sym_table_t* sysmap_load_symbols(const char* path);
+
+// 二分搜尋：addr 對應的函數符號
+static const elf_sym_t* elf_resolve_addr(const elf_sym_table_t* table, uintptr_t query_addr);
+
+// 釋放符號表
+static void elf_free_sym_table(elf_sym_table_t* t);
+
+// 輸出 ELF vs profiler 對比報表
+static void print_elf_symbol_report(elf_sym_table_t* sym_table, hash_table_t* ht);
+```
+
+---
+
+### 9. CLI 使用方式（Phase 7）
+
+```bash
+# 使用自身 binary 的 .symtab
+./main --resolve-symbols
+
+# 指定 ELF 檔案
+./main --resolve-symbols=/path/to/binary
+
+# 使用 System.map 格式（stripped binary 備援）
+nm main | awk '$2~/^[Tt]$/{print $1,$2,$3}' > my.map
+./main_stripped --resolve-symbols=my.map --sysmap
+```
+
+---
+
+### 10. 本階段學到的核心觀念
+
+1. **ELF 格式** = 固定 Header + Section Header Table + 各 Section 資料
+2. **三個 section 的關係**：.shstrtab（section 名稱） + .symtab（符號） + .strtab（符號名稱）
+3. **sh_link 欄位**：.symtab 的 sh_link 直接指向對應的 .strtab，比名稱查找更可靠
+4. **mmap 零拷貝讀檔**：映射後直接用指標存取，但 munmap 後指標失效
+5. **strip 的影響**：移除 .symtab，.dynsym 保留（動態連結器需要）
+6. **System.map 是文字備援**：任何程式都可產生，適合跨機器 profiling
+7. **二分搜尋找左邊界**：「最後一個 ≤ query」的模式
+8. **ELF 安全性**：e_shstrndx 需要上界檢查，e_shoff 需要範圍驗證
+
+---
+
+### 總結：Phase 7 的價值
+
+**技術成就**:
+- ✅ 純 C 實作 ELF parser（無第三方函式庫）
+- ✅ 支援 ELF .symtab 和 System.map 兩種格式
+- ✅ 二分搜尋確保 O(log n) 查詢效率
+- ✅ 多執行緒模式正確處理（merged hash table）
+
+**學習價值**:
+- 深入理解 ELF 二進位格式
+- 掌握 mmap() 的使用與注意事項
+- 實踐二分搜尋的「左邊界」變體
+- 理解 strip 對符號表的影響
+- 學習 System.map 格式與應用
+
+---
+
 ## 總結
 
 **已完成階段**:
@@ -3236,11 +3788,11 @@ Phase 5 不僅是功能升級，更是深入學習系統程式設計的絕佳機
 - Phase 2: I/O Wait Time 估算
 - Phase 3: 多執行緒支援 (TLS)
 - Phase 4: 多執行緒報表輸出
-- Phase 5: 動態記憶體與 Hash Table ✨ (NEW)
+- Phase 5: 動態記憶體與 Hash Table
+- Phase 6: gmon.out 格式輸出
+- Phase 7: ELF 符號解析 ✨ (NEW)
 - Phase 8: 視覺化輸出 (Graphviz)
 
-**未完成階段** (可作為未來擴展):
-- Phase 6: gmon.out 格式輸出
-- Phase 7: ELF 符號解析
+**未完成階段**: 所有規劃階段均已完成！
 
-專案已具備完整的 profiling、多執行緒、視覺化和動態記憶體管理功能！
+專案已具備完整的 profiling、多執行緒、視覺化、動態記憶體管理和 ELF 符號解析功能！
