@@ -179,6 +179,36 @@ static elf_sym_table_t* elf_load_symbols(const char* path) {
     return table;
 }
 
+// Phase 7: Resolve an address to the nearest function symbol using binary search.
+// Returns the symbol entry whose address is <= query_addr and query_addr < addr+size.
+// If the symbol has size 0 (unknown), returns the closest symbol with addr <= query_addr.
+// Returns NULL if no matching symbol found.
+static const elf_sym_t* elf_resolve_addr(const elf_sym_table_t* table, uintptr_t query_addr) {
+    if (!table || table->count == 0) return NULL;
+
+    int lo = 0, hi = table->count - 1;
+    const elf_sym_t* best = NULL;
+
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (table->entries[mid].addr <= query_addr) {
+            best = &table->entries[mid];
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    if (!best) return NULL;
+
+    // If symbol has known size, verify addr is within range
+    if (best->size > 0 && query_addr >= best->addr + best->size) {
+        return NULL;  // Address is past this symbol's end
+    }
+
+    return best;
+}
+
 #define MAX_FUNCTIONS 1000
 #define MAX_CALL_STACK 100
 #define PROFILING_INTERVAL 10000 //sample interval 10ms
@@ -1972,7 +2002,6 @@ int main(int argc, char* argv[]) {
             return 0;
         }
     }
-
     start_profiling();
 
     if (shared_test) {
