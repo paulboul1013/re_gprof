@@ -347,6 +347,9 @@ static thread_data_snapshot_t* thread_snapshots[MAX_THREADS];
 static int thread_snapshot_count = 0;
 static pthread_mutex_t snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Phase 7: Global ELF symbol table (loaded after profiling, freed after report)
+static elf_sym_table_t* g_sym_table = NULL;
+
 
 // Thread-local storage (Phase 5): Each thread has its own hash tables
 __thread hash_table_t* functions = NULL;
@@ -1988,6 +1991,74 @@ void run_multi_threaded_tests() {
     printf("========================================\n");
 }
 
+// Phase 7: Print ELF symbol resolution report.
+// Compares profiler-captured function addresses against ELF/System.map symbols.
+static void print_elf_symbol_report(elf_sym_table_t* sym_table, hash_table_t* ht) {
+    printf("\n================================================================================\n");
+    printf("ELF Symbol Resolution Report (Phase 7)\n");
+    printf("================================================================================\n");
+    printf("%-40s %-18s %-18s %s\n",
+           "Function (profiler)", "Profiler Addr", "ELF Addr", "Match?");
+    printf("%-40s %-18s %-18s %s\n",
+           "----------------------------------------",
+           "------------------", "------------------", "-------");
+
+    if (!ht) {
+        printf("(no profiling data)\n");
+        return;
+    }
+
+    int matched = 0, total = 0;
+    for (int i = 0; i < ht->capacity; i++) {
+        hash_entry_t* entry = ht->buckets[i];
+        while (entry) {
+            function_info_t* func = &entry->value;
+            total++;
+
+            const char* match_str = "-";
+            const char* elf_name = "(not found)";
+            char elf_addr_str[32] = "(none)";
+
+            if (func->addr && sym_table) {
+                const elf_sym_t* sym = elf_resolve_addr(sym_table, (uintptr_t)func->addr);
+                if (sym) {
+                    snprintf(elf_addr_str, sizeof(elf_addr_str), "0x%016lx", (unsigned long)sym->addr);
+                    elf_name = sym->name;
+                    if (strcmp(sym->name, func->name) == 0) {
+                        match_str = "OK";
+                        matched++;
+                    } else {
+                        match_str = "MISMATCH";
+                    }
+                }
+            }
+
+            printf("%-40s 0x%016lx %-18s %s (%s)\n",
+                   func->name,
+                   func->addr ? (unsigned long)(uintptr_t)func->addr : 0UL,
+                   elf_addr_str,
+                   match_str,
+                   elf_name);
+
+            entry = entry->next;
+        }
+    }
+
+    printf("\nSummary: %d/%d functions matched ELF symbols\n", matched, total);
+
+    // Print all ELF symbols (sorted by address)
+    if (sym_table && sym_table->count > 0) {
+        printf("\n--- All ELF Function Symbols (%d total) ---\n", sym_table->count);
+        printf("%-18s %-10s %s\n", "Address", "Size", "Name");
+        for (int i = 0; i < sym_table->count; i++) {
+            printf("0x%016lx %-10lu %s\n",
+                   (unsigned long)sym_table->entries[i].addr,
+                   (unsigned long)sym_table->entries[i].size,
+                   sym_table->entries[i].name);
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     init_profilier();
 
@@ -2007,6 +2078,8 @@ int main(int argc, char* argv[]) {
     int shared_test = 0;
     int export_dot = 0;   // Phase 8: Export call graph to DOT format
     int export_gmon = 0;  // Phase 6: Export gmon.out binary file
+    char resolve_symbols_path[512] = "";  // Phase 7: path to ELF or System.map
+    int use_sysmap = 0;                   // Phase 7: use System.map format instead of ELF
     char report_mode[32] = "per-thread";  // default: per-thread, options: merged, both
     char dot_mode[32] = "merged";  // Phase 8: per-thread or merged
 
@@ -2024,6 +2097,13 @@ int main(int argc, char* argv[]) {
             strncpy(dot_mode, argv[i] + 11, 31);  // Phase 8: per-thread or merged
         } else if (strcmp(argv[i], "--export-gmon") == 0) {
             export_gmon = 1;  // Phase 6: Enable gmon.out export
+        } else if (strncmp(argv[i], "--resolve-symbols=", 18) == 0) {
+            strncpy(resolve_symbols_path, argv[i] + 18, 511);
+            resolve_symbols_path[511] = '\0';
+        } else if (strcmp(argv[i], "--resolve-symbols") == 0) {
+            strncpy(resolve_symbols_path, "/proc/self/exe", 511);
+        } else if (strcmp(argv[i], "--sysmap") == 0) {
+            use_sysmap = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("\nUsage: %s [options]\n", argv[0]);
             printf("Options:\n");
@@ -2033,6 +2113,9 @@ int main(int argc, char* argv[]) {
             printf("  --export-dot             Export call graph to Graphviz DOT format (Phase 8)\n");
             printf("  --dot-mode=MODE          DOT export mode: per-thread or merged (default: merged)\n");
             printf("  --export-gmon            Export gmon.out binary file for gprof analysis (Phase 6)\n");
+            printf("  --resolve-symbols        Resolve addresses via ELF .symtab (Phase 7)\n");
+            printf("  --resolve-symbols=PATH   Use specified ELF file or System.map\n");
+            printf("  --sysmap                 Treat --resolve-symbols path as System.map format\n");
             printf("  --help                   Show this help message\n\n");
             printf("Examples:\n");
             printf("  %s                                    # Single-threaded test\n", argv[0]);
@@ -2059,6 +2142,15 @@ int main(int argc, char* argv[]) {
     }
 
     stop_profiling();
+
+    // Phase 7: Load ELF/System.map symbols if requested
+    if (resolve_symbols_path[0] != '\0') {
+        if (use_sysmap) {
+            g_sym_table = sysmap_load_symbols(resolve_symbols_path);
+        } else {
+            g_sym_table = elf_load_symbols(resolve_symbols_path);
+        }
+    }
 
     // Phase 5: Generate reports based on mode
     if (multi_threaded || shared_test) {
@@ -2106,9 +2198,23 @@ int main(int argc, char* argv[]) {
             export_gmon_out("gmon.out", 1);
         }
 
+        // Phase 7: ELF symbol resolution report
+        if (g_sym_table) {
+            print_elf_symbol_report(g_sym_table, functions);
+            elf_free_sym_table(g_sym_table);
+            g_sym_table = NULL;
+        }
+
         cleanup_thread_snapshots();
     } else {
         // Single-threaded: report already printed inside run_single_threaded_tests()
+        // Phase 7: ELF symbol resolution report
+        if (g_sym_table) {
+            print_elf_symbol_report(g_sym_table, functions);
+            elf_free_sym_table(g_sym_table);
+            g_sym_table = NULL;
+        }
+
         // Phase 6: Export gmon.out using current thread's TLS data
         if (export_gmon) {
             printf("\n");
