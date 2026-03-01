@@ -1,6 +1,6 @@
 CC := gcc
-CFLAGS := -Wall -Wextra -D_GNU_SOURCE -DAUTO_PROFILE -g -pthread -rdynamic -no-pie -fno-pie -Iinclude
-LDFLAGS := -lm -ldl
+CFLAGS := -Wall -Wextra -D_GNU_SOURCE -g -Iinclude
+LDFLAGS :=
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
 
